@@ -1,0 +1,35 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# BPF compiled objects
+*.bpf.o
+ebpf/c/*.o
+
+# Logs
+*.log
+nohup.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+.uv/
