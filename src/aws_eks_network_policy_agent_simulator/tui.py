@@ -12,7 +12,6 @@ from textual.binding import Binding
 from textual.reactive import reactive
 
 from .environment import EnvironmentManager
-from .network import NetworkManager
 from .network_multi import MultiPodNetworkManager
 from .bpf import BPFManager
 
