@@ -931,7 +931,7 @@ class EBPFManagerApp(App):
             total, sampled, index = get_stack_capture_stats()
             output.write(f"  [dim]Stats: {total:,} packets seen, {sampled:,} sampled, {index} in buffer[/dim]")
         else:
-            output.write("  [yellow]⚠ Not running - click 'Start Capture' or run Setup[/yellow]")
+            output.write("  [yellow]⚠ Not running - run Setup to start[/yellow]")
         
         output.write("")
     

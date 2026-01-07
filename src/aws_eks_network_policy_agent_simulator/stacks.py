@@ -104,9 +104,19 @@ def start_tc_stack_capture() -> bool:
             except Exception:
                 os._exit(1)
         else:
-            # Parent process
+            # Parent process - wait briefly and verify child is still running
             _tc_capture_pid = pid
-            return True
+            import time
+            time.sleep(0.5)  # Give child time to start or fail
+            
+            # Check if child is still running
+            try:
+                os.kill(pid, 0)  # Signal 0 just checks if process exists
+                return True
+            except OSError:
+                # Child died, likely failed to attach kprobe
+                _tc_capture_pid = None
+                return False
     except Exception as e:
         return False
 
