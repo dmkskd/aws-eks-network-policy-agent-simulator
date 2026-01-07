@@ -6,9 +6,11 @@ import socket
 from pathlib import Path
 from typing import Optional
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from .environment import EnvironmentManager
+from .status import StatusReporter
 
 console = Console()
 
@@ -16,10 +18,11 @@ console = Console()
 class BPFManager:
     """Manages BPF program loading and map operations."""
     
-    def __init__(self, interface: str = "veth-host", source_file: Optional[Path] = None):
+    def __init__(self, interface: str = "veth-host", source_file: Optional[Path] = None, output=None):
         self.interface = interface
         self.program_id: Optional[int] = None
         self.map_id: Optional[int] = None
+        self.output = output  # Optional TUI output log
         
         # Discover or use provided source file
         if source_file:
@@ -36,6 +39,7 @@ class BPFManager:
         self.obj_file: Optional[Path] = None
         self.egress_obj_file: Optional[Path] = None
         self.env_mgr = EnvironmentManager()
+        self.status_reporter = StatusReporter(self.env_mgr, interface)
     
     def _discover_source_file(self) -> Optional[Path]:
         """Auto-discover BPF source file in current directory."""
@@ -97,45 +101,58 @@ class BPFManager:
     def compile(self) -> bool:
         """Compile BPF source to object file."""
         if not self.source_file or not self.source_file.exists():
-            console.print(f"[red][ERROR] Source file not found: {self.source_file}[/red]")
+            self._print(f"[red][ERROR] Source file not found: {self.source_file}[/red]")
             return False
         
         # Check for vmlinux.h if using AWS source
         if "tc.v4ingress" in str(self.source_file) or "tc.v4egress" in str(self.source_file):
             vmlinux_h = self.source_file.parent / "vmlinux.h"
             if not vmlinux_h.exists():
-                console.print(f"[yellow][WARN] vmlinux.h not found at {vmlinux_h}[/yellow]")
-                console.print("[yellow]Generating vmlinux.h from kernel BTF...[/yellow]")
+                self._print(f"[yellow][WARN] vmlinux.h not found, generating...[/yellow]")
                 try:
                     subprocess.run(
                         ["bpftool", "btf", "dump", "file", "/sys/kernel/btf/vmlinux", "format", "c"],
                         stdout=open(vmlinux_h, "w"),
                         check=True
                     )
-                    console.print(f"[green][OK] Generated vmlinux.h[/green]")
+                    self._print(f"[cyan]$ bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h[/cyan]")
                 except Exception as e:
-                    console.print(f"[red][ERROR] Failed to generate vmlinux.h: {e}[/red]")
+                    self._print(f"[red][ERROR] Failed to generate vmlinux.h: {e}[/red]")
                     return False
         
+        # Compile ingress
+        self._print(f"[yellow]Compiling ingress program...[/yellow]")
         result = self.env_mgr.compile_bpf_program(self.source_file)
         
         if result:
             self.obj_file = result
-            console.print(f"[green][OK] Compiled ingress program: {self.obj_file.name}[/green]")
+            self._print(f"[cyan]$ clang -O2 -target bpf -c {self.source_file.name} -o {result.name}[/cyan]")
+            self._print(f"[dim]Created: {self.obj_file.name}[/dim]")
         else:
+            self._print("[red][ERROR] Ingress compilation failed[/red]")
             return False
         
         # Also compile egress program if available
         if self.egress_source_file:
-            console.print(f"\n[blue]Compiling egress program...[/blue]")
+            self._print("")
+            self._print(f"[yellow]Compiling egress program...[/yellow]")
             egress_result = self.env_mgr.compile_bpf_program(self.egress_source_file)
             if egress_result:
                 self.egress_obj_file = egress_result
-                console.print(f"[green][OK] Compiled egress program: {self.egress_obj_file.name}[/green]")
+                self._print(f"[cyan]$ clang -O2 -target bpf -c {self.egress_source_file.name} -o {egress_result.name}[/cyan]")
+                self._print(f"[dim]Created: {self.egress_obj_file.name}[/dim]")
             else:
-                console.print("[yellow][WARN] Egress compilation failed, continuing with ingress only[/yellow]")
+                self._print("[yellow][WARN] Egress compilation failed, continuing with ingress only[/yellow]")
         
+        self._print("")
         return True
+    
+    def _print(self, message: str) -> None:
+        """Print to TUI output log if available, otherwise console."""
+        if self.output:
+            self.output.write(message)
+        else:
+            console.print(message)
     
     def _run(self, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
         """Run a command and return result."""
@@ -157,35 +174,36 @@ class BPFManager:
     
     def setup_qdisc(self) -> bool:
         """Setup clsact qdisc on interface."""
-        console.print(f"\n[blue]Setting up TC qdisc on {self.interface}...[/blue]")
+        self._print(f"[yellow]Setting up TC qdisc...[/yellow]")
         
         # Check if already exists
         result = self._run(["tc", "qdisc", "show", "dev", self.interface], check=False)
         
         if "clsact" in result.stdout:
-            console.print("[green][OK] clsact qdisc already exists[/green]")
-            return True
-        
-        try:
-            self._run(["tc", "qdisc", "add", "dev", self.interface, "clsact"])
-            console.print("[green][OK] clsact qdisc created[/green]")
-            return True
-        except Exception as e:
-            console.print(f"[red][ERROR] Failed to setup qdisc: {e}[/red]")
-            return False
+            self._print(f"[dim]clsact qdisc already exists on {self.interface}[/dim]")
+        else:
+            try:
+                self._run(["tc", "qdisc", "add", "dev", self.interface, "clsact"])
+                self._print(f"[cyan]$ tc qdisc add dev {self.interface} clsact[/cyan]")
+            except Exception as e:
+                self._print(f"[red][ERROR] Failed to setup qdisc: {e}[/red]")
+                return False
+        self._print("")
+        return True
     
     def cleanup_filters(self) -> None:
         """Remove existing BPF filters."""
-        console.print("[yellow]Cleaning old BPF filters...[/yellow]")
+        self._print("[yellow]Cleaning old BPF filters...[/yellow]")
         result = self._run(
             ["tc", "filter", "del", "dev", self.interface, "ingress"],
             check=False
         )
         
         if result.returncode == 0:
-            console.print("  → Old filters removed")
+            self._print(f"[cyan]$ tc filter del dev {self.interface} ingress[/cyan]")
         else:
-            console.print("  → No previous filters found")
+            self._print(f"[dim]No previous ingress filters found on {self.interface}[/dim]")
+        self._print("")
     
     def cleanup_pinned_maps(self) -> None:
         """Remove pinned BPF maps to ensure clean state.
@@ -193,13 +211,14 @@ class BPFManager:
         Pinned maps persist across program loads. This clears them
         to prevent stale entries from affecting new policy evaluations.
         """
-        console.print("[yellow]Cleaning pinned BPF maps...[/yellow]")
+        self._print("[yellow]Cleaning pinned BPF maps...[/yellow]")
         
         map_names = [
             "ingress_map",
             "cp_ingress_map", 
             "ingress_pod_state_map",
-            "aws_conntrack_map"
+            "aws_conntrack_map",
+            "stack_traces"
         ]
         
         for map_name in map_names:
@@ -208,11 +227,20 @@ class BPFManager:
             result = self._run(["rm", "-f", map_path], check=False)
             
             if result.returncode == 0:
-                console.print(f"  → Removed pinned map: {map_name}")
-            else:
-                console.print(f"  → Map {map_name} not found (ok)")
+                self._print(f"[cyan]$ rm -f /sys/fs/bpf/{map_name}[/cyan]")
         
-        console.print("[green][OK] Map cleanup complete[/green]")
+        # Clean up kprobe program and link
+        kprobe_paths = [
+            "/sys/fs/bpf/kprobe_stacktrace",
+            "/sys/fs/bpf/kprobe_stack_link"
+        ]
+        
+        for path in kprobe_paths:
+            result = self._run(["rm", "-f", path], check=False)
+            if result.returncode == 0:
+                self._print(f"[cyan]$ rm -f {Path(path).name}[/cyan]")
+        
+        self._print("")
     
     def load_program(self, obj_file: Optional[Path] = None) -> bool:
         """Load BPF program and attach to HOST side of veth interface.
@@ -228,12 +256,12 @@ class BPFManager:
             self.obj_file = obj_file
         
         if not self.obj_file or not self.obj_file.exists():
-            console.print(f"[red][ERROR] Object file not found: {self.obj_file}[/red]")
-            console.print("[yellow][WARN] Compile the program first[/yellow]")
+            self._print(f"[red][ERROR] Object file not found: {self.obj_file}[/red]")
+            self._print("[yellow][WARN] Compile the program first[/yellow]")
             return False
         
-        console.print(f"\n[blue]Attaching BPF to HOST side: {self.interface}[/blue]")
-        console.print(f"[dim]Program: {self.obj_file.name}[/dim]")
+        program_type = "ingress" if "ingress" in str(self.obj_file) else "egress" if "egress" in str(self.obj_file) else "unknown"
+        self._print(f"[yellow]Loading {program_type} BPF program...[/yellow]")
         
         try:
             # Detect section name based on source file
@@ -253,48 +281,43 @@ class BPFManager:
                 "sec", section
             ]
             
-            console.print(f"[dim]Command: {' '.join(cmd)}[/dim]")
-            console.print(f"[dim]Section: {section}, Direction: {direction}[/dim]")
+            self._print(f"[cyan]$ tc filter add dev {self.interface} {direction} bpf da obj {self.obj_file.name} sec {section}[/cyan]")
             
             result = self._run(cmd, check=False)
             
             if result.returncode != 0:
-                console.print("[red][ERROR] TC filter failed to load BPF program[/red]")
+                self._print("[red][ERROR] TC filter failed to load BPF program[/red]")
                 if result.stderr:
-                    console.print(f"[red]Error output:[/red]")
                     for line in result.stderr.strip().split('\n'):
-                        console.print(f"  {line}")
+                        self._print(f"  [red]{line}[/red]")
                 if result.stdout:
-                    console.print(f"[yellow]Additional output:[/yellow]")
                     for line in result.stdout.strip().split('\n'):
-                        console.print(f"  {line}")
+                        self._print(f"  [yellow]{line}[/yellow]")
                 return False
             
-            console.print("[green][OK] BPF program attached to interface[/green]")
+            self._print(f"[dim]BPF program attached to {self.interface}[/dim]")
+            self._print("")
             
-            # Initialize pod state maps for AWS VPC CNI
+            # Initialize pod state maps for AWS VPC CNI (only for ingress program)
             if "tc.v4ingress" in str(self.obj_file):
-                console.print("[dim]Initializing pod state maps for AWS VPC CNI...[/dim]")
+                self._print("[yellow]Initializing pod state maps...[/yellow]")
                 if self.initialize_pod_state_maps():
-                    console.print("[green][OK] Pod state maps initialized[/green]")
+                    self._print("[dim]Pod state maps initialized[/dim]")
                 else:
-                    console.print("[yellow][WARN] Map initialization skipped (may not be needed)[/yellow]")
+                    self._print("[yellow][WARN] Map initialization skipped[/yellow]")
                 
-                # Cache ingress_map ID for later use
-                console.print("[dim]Caching ingress_map ID...[/dim]")
-                self.map_id = self.find_map("ingress_map")
-                if self.map_id:
-                    console.print(f"[green][OK] Cached ingress_map ID: {self.map_id}[/green]")
+                # Cache ingress_map ID for later use (silent)
+                self.map_id = self.find_map("ingress_map", silent=True)
+                self._print("")
             
             return True
             
         except Exception as e:
-            console.print(f"[red][ERROR] Failed to load program: {e}[/red]")
+            self._print(f"[red][ERROR] Failed to load program: {e}[/red]")
             return False
     
     def verify_program(self) -> bool:
         """Verify program is loaded and get its ID."""
-        console.print("\n[blue]Verifying BPF program...[/blue]")
         
         try:
             # Determine direction based on program type
@@ -302,8 +325,6 @@ class BPFManager:
             
             # Get filter info
             result = self._run(["tc", "filter", "show", "dev", self.interface, direction])
-            console.print(f"[dim]TC Filter Output ({direction}):[/dim]")
-            console.print(f"[dim]{result.stdout}[/dim]")
             
             # Extract program ID
             for line in result.stdout.split('\n'):
@@ -315,22 +336,17 @@ class BPFManager:
                             break
             
             if self.program_id:
-                console.print(f"[green][OK] Program loaded with ID: {self.program_id}[/green]")
-                
-                # Get detailed program info
-                result = self._run(["bpftool", "prog", "show", "id", str(self.program_id)])
-                console.print(f"[dim]{result.stdout}[/dim]")
-                
+                self._print(f"[dim]Program ID: {self.program_id}[/dim]")
                 return True
             else:
-                console.print("[red][ERROR] Could not determine program ID[/red]")
+                self._print("[red][ERROR] Could not determine program ID[/red]")
                 return False
                 
         except Exception as e:
-            console.print(f"[red][ERROR] Verification failed: {e}[/red]")
+            self._print(f"[red][ERROR] Verification failed: {e}[/red]")
             return False
     
-    def find_map(self, map_name: str = "ingress_map") -> Optional[int]:
+    def find_map(self, map_name: str = "ingress_map", silent: bool = False) -> Optional[int]:
         """Find BPF map by name and return its ID.
         
         Note: BPF map names are truncated to 15 characters (BPF_OBJ_NAME_LEN).
@@ -351,14 +367,17 @@ class BPFManager:
                         map_id = int(line.split(':')[0])
                         if map_name == "ingress_map":
                             self.map_id = map_id
-                        console.print(f"[green][OK] Found map '{map_name}' (as '{search_name}') with ID: {map_id}[/green]")
+                        if not silent:
+                            self._print(f"[dim]Found map '{map_name}' with ID: {map_id}[/dim]")
                         return map_id
             
-            console.print(f"[red][ERROR] Map '{map_name}' not found[/red]")
+            if not silent:
+                self._print(f"[yellow][WARN] Map '{map_name}' not found[/yellow]")
             return None
             
         except Exception as e:
-            console.print(f"[red][ERROR] Error finding map: {e}[/red]")
+            if not silent:
+                self._print(f"[red][ERROR] Error finding map: {e}[/red]")
             return None
     
     def initialize_pod_state_maps(self) -> bool:
@@ -368,12 +387,11 @@ class BPFManager:
         - Ingress: Sets to POLICIES_APPLIED (0) for deny-by-default on incoming connections
         - Egress: Sets to DEFAULT_ALLOW (1) to permit all outbound connections
         """
-        console.print("\n[blue]Initializing pod state maps...[/blue]")
         
         # Initialize ingress pod state map
-        ingress_pod_state_map_id = self.find_map("ingress_pod_state_map")
+        ingress_pod_state_map_id = self.find_map("ingress_pod_state_map", silent=True)
         if not ingress_pod_state_map_id:
-            console.print("[yellow][WARN] Ingress pod state map not found[/yellow]")
+            self._print("[yellow][WARN] Ingress pod state map not found[/yellow]")
         else:
             try:
                 # NETWORK_POLICY_KEY = 0, state = POLICIES_APPLIED (0)
@@ -383,7 +401,7 @@ class BPFManager:
                     "key", "hex", "00", "00", "00", "00",
                     "value", "hex", "00"
                 ]
-                console.print(f"[dim]Ingress: Setting NETWORK_POLICY_KEY=0 to POLICIES_APPLIED[/dim]")
+                self._print(f"[cyan]$ bpftool map update id {ingress_pod_state_map_id} key 0x00000000 value 0x00[/cyan]")
                 self._run(cmd1)
                 
                 # CLUSTER_NETWORK_POLICY_KEY = 1, state = POLICIES_APPLIED (0)
@@ -393,16 +411,16 @@ class BPFManager:
                     "key", "hex", "01", "00", "00", "00",
                     "value", "hex", "00"
                 ]
-                console.print(f"[dim]Ingress: Setting CLUSTER_NETWORK_POLICY_KEY=1 to POLICIES_APPLIED[/dim]")
+                self._print(f"[cyan]$ bpftool map update id {ingress_pod_state_map_id} key 0x01000000 value 0x00[/cyan]")
                 self._run(cmd2)
                 
-                console.print("[green][OK] Ingress pod state: POLICIES_APPLIED (deny-by-default)[/green]")
+                self._print("[dim]Ingress pod state: POLICIES_APPLIED (deny-by-default)[/dim]")
             except Exception as e:
-                console.print(f"[red][ERROR] Failed to initialize ingress pod state: {e}[/red]")
+                self._print(f"[red][ERROR] Failed to initialize ingress pod state: {e}[/red]")
                 return False
         
         # Initialize egress pod state map (allow all outbound by default)
-        egress_pod_state_map_id = self.find_map("egress_pod_state_map")
+        egress_pod_state_map_id = self.find_map("egress_pod_state_map", silent=True)
         if egress_pod_state_map_id:
             try:
                 # NETWORK_POLICY_KEY = 0, state = DEFAULT_ALLOW (1)
@@ -412,7 +430,7 @@ class BPFManager:
                     "key", "hex", "00", "00", "00", "00",
                     "value", "hex", "01"
                 ]
-                console.print(f"[dim]Egress: Setting NETWORK_POLICY_KEY=0 to DEFAULT_ALLOW[/dim]")
+                self._print(f"[cyan]$ bpftool map update id {egress_pod_state_map_id} key 0x00000000 value 0x01[/cyan]")
                 self._run(cmd1)
                 
                 # CLUSTER_NETWORK_POLICY_KEY = 1, state = DEFAULT_ALLOW (1)
@@ -422,14 +440,14 @@ class BPFManager:
                     "key", "hex", "01", "00", "00", "00",
                     "value", "hex", "01"
                 ]
-                console.print(f"[dim]Egress: Setting CLUSTER_NETWORK_POLICY_KEY=1 to DEFAULT_ALLOW[/dim]")
+                self._print(f"[cyan]$ bpftool map update id {egress_pod_state_map_id} key 0x01000000 value 0x01[/cyan]")
                 self._run(cmd2)
                 
-                console.print("[green][OK] Egress pod state: DEFAULT_ALLOW (permit all outbound)[/green]")
+                self._print("[dim]Egress pod state: DEFAULT_ALLOW (permit all outbound)[/dim]")
             except Exception as e:
-                console.print(f"[yellow][WARN] Failed to initialize egress pod state: {e}[/yellow]")
+                self._print(f"[yellow][WARN] Failed to initialize egress pod state: {e}[/yellow]")
         else:
-            console.print("[dim]Egress pod state map not found (egress program may not be loaded)[/dim]")
+            self._print("[dim]Egress pod state map not found (egress program may not be loaded)[/dim]")
         
         return True
     
@@ -757,8 +775,8 @@ class BPFManager:
             self.obj_file = obj_file
         
         if not self.obj_file or not self.obj_file.exists():
-            console.print(f"[red][ERROR] Object file not found: {self.obj_file}[/red]")
-            console.print("[yellow][WARN] Compile the program first[/yellow]")
+            self._print(f"[red][ERROR] Object file not found: {self.obj_file}[/red]")
+            self._print("[yellow][WARN] Compile the program first[/yellow]")
             return False
         
         if not self.setup_qdisc():
@@ -770,7 +788,6 @@ class BPFManager:
         self.cleanup_pinned_maps()
         
         # Load ingress program (K8s Ingress policy - checks SOURCE IP)
-        console.print("\n[blue]Loading ingress program...[/blue]")
         if not self.load_program():
             return False
         
@@ -779,29 +796,26 @@ class BPFManager:
         
         # Load egress program if available (K8s Egress policy - checks DESTINATION IP)
         if self.egress_obj_file and self.egress_obj_file.exists():
-            console.print("\n[blue]Loading egress program...[/blue]")
             # Temporarily switch to egress program
             original_obj = self.obj_file
             self.obj_file = self.egress_obj_file
             
             if not self.load_program():
-                console.print("[yellow][WARN] Egress program failed to load, continuing with ingress only[/yellow]")
+                self._print("[yellow][WARN] Egress program failed to load, continuing with ingress only[/yellow]")
+                self._print("")
                 self.obj_file = original_obj  # Restore
             else:
                 # Verify egress program
                 if self.verify_program():
-                    console.print("[green][OK] Egress program loaded successfully[/green]")
+                    self._print("[dim]Egress program loaded successfully[/dim]")
+                    self._print("")
                 else:
-                    console.print("[yellow][WARN] Egress program verification failed[/yellow]")
+                    self._print("[yellow][WARN] Egress program verification failed[/yellow]")
+                    self._print("")
                 self.obj_file = original_obj  # Restore
+        else:
+            self._print("")
         
-        # Find the ingress map
-        self.find_map("ingress_map")
-        
-        # Initialize pod state maps (required for AWS VPC CNI)
-        self.initialize_pod_state_maps()
-        
-        console.print("\n[green bold][OK] BPF program(s) active[/green bold]")
         return True
     
     def full_setup(self) -> bool:
@@ -842,265 +856,4 @@ class BPFManager:
         Returns:
             dict: Status report with step results
         """
-        from rich.table import Table
-        
-        if print_output:
-            console.print("\n[bold cyan]═══ System Status Report ═══[/bold cyan]")
-        
-        report = {
-            "steps": [],
-            "overall_status": "PASS"
-        }
-        
-        # Step 1: Network Setup
-        step1 = {"id": 1, "name": "Network Setup", "status": "PASS", "details": []}
-        try:
-            # Check namespaces
-            result = self._run(["ip", "netns", "list"], check=False)
-            namespaces = ["ns-backend", "ns-allowed", "ns-denied"]
-            found_ns = []
-            for ns in namespaces:
-                if ns in result.stdout:
-                    found_ns.append(ns)
-                    step1["details"].append(f"✓ Namespace {ns} exists")
-                else:
-                    step1["status"] = "FAIL"
-                    step1["details"].append(f"✗ Namespace {ns} missing")
-            
-            # Check interfaces
-            if self.interface:
-                result = self._run(["ip", "link", "show", self.interface], check=False)
-                if result.returncode == 0:
-                    step1["details"].append(f"✓ Interface {self.interface} exists")
-                else:
-                    step1["status"] = "FAIL"
-                    step1["details"].append(f"✗ Interface {self.interface} not found")
-        except Exception as e:
-            step1["status"] = "FAIL"
-            step1["details"].append(f"✗ Error: {str(e)[:50]}")
-        
-        report["steps"].append(step1)
-        
-        # Step 2: Compilation
-        step2 = {"id": 2, "name": "Program Compilation", "status": "PASS", "details": []}
-        try:
-            # Look for compiled files even if not in self.obj_file
-            c_dir = Path.cwd() / "ebpf" / "c"
-            ingress_obj = c_dir / "tc.v4ingress.bpf.o"
-            egress_obj = c_dir / "tc.v4egress.bpf.o"
-            
-            if ingress_obj.exists():
-                size = ingress_obj.stat().st_size
-                step2["details"].append(f"✓ Ingress program compiled ({size} bytes)")
-                # Update self.obj_file for later checks
-                if not self.obj_file:
-                    self.obj_file = ingress_obj
-            elif self.obj_file and self.obj_file.exists():
-                size = self.obj_file.stat().st_size
-                step2["details"].append(f"✓ Ingress program compiled ({size} bytes)")
-            else:
-                step2["status"] = "FAIL"
-                step2["details"].append(f"✗ Ingress .o file not found")
-            
-            if egress_obj.exists():
-                size = egress_obj.stat().st_size
-                step2["details"].append(f"✓ Egress program compiled ({size} bytes)")
-                # Update self.egress_obj_file for later checks
-                if not self.egress_obj_file:
-                    self.egress_obj_file = egress_obj
-            elif self.egress_obj_file and self.egress_obj_file.exists():
-                size = self.egress_obj_file.stat().st_size
-                step2["details"].append(f"✓ Egress program compiled ({size} bytes)")
-            else:
-                step2["status"] = "WARN"
-                step2["details"].append(f"⚠ Egress .o file not found (optional)")
-        except Exception as e:
-            step2["status"] = "FAIL"
-            step2["details"].append(f"✗ Error: {str(e)[:50]}")
-        
-        report["steps"].append(step2)
-        
-        # Step 3: Qdisc Setup
-        step3 = {"id": 3, "name": "TC Qdisc Setup", "status": "PASS", "details": []}
-        try:
-            result = self._run(["tc", "qdisc", "show", "dev", self.interface], check=False)
-            if "clsact" in result.stdout:
-                step3["details"].append(f"✓ clsact qdisc attached to {self.interface}")
-            else:
-                step3["status"] = "FAIL"
-                step3["details"].append(f"✗ clsact qdisc not found on {self.interface}")
-        except Exception as e:
-            step3["status"] = "FAIL"
-            step3["details"].append(f"✗ Error: {str(e)[:50]}")
-        
-        report["steps"].append(step3)
-        
-        # Step 4: Program Load
-        step4 = {"id": 4, "name": "BPF Program Load", "status": "PASS", "details": []}
-        try:
-            # Check ingress program (attaches to TC egress because it checks packets going TO pod)
-            direction = "egress" if self.obj_file and "ingress" in str(self.obj_file) else "ingress"
-            result = self._run(["tc", "filter", "show", "dev", self.interface, direction], check=False)
-            if "bpf" in result.stdout and "tc_cls" in result.stdout:
-                step4["details"].append(f"✓ Ingress program attached (TC {direction})")
-                # Extract program ID
-                for line in result.stdout.split('\n'):
-                    if 'id' in line:
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if part == 'id' and i + 1 < len(parts):
-                                prog_id = parts[i + 1]
-                                step4["details"].append(f"  Program ID: {prog_id}")
-                                break
-            else:
-                step4["status"] = "FAIL"
-                step4["details"].append(f"✗ Ingress program not attached to TC {direction}")
-            
-            # Check egress program if it exists (attaches to TC ingress because it checks packets FROM pod)
-            if self.egress_obj_file and self.egress_obj_file.exists():
-                egress_direction = "ingress" if "egress" in str(self.egress_obj_file) else "egress"
-                result = self._run(["tc", "filter", "show", "dev", self.interface, egress_direction], check=False)
-                if "bpf" in result.stdout:
-                    step4["details"].append(f"✓ Egress program attached (TC {egress_direction})")
-                    # Extract egress program ID
-                    for line in result.stdout.split('\n'):
-                        if 'id' in line:
-                            parts = line.split()
-                            for i, part in enumerate(parts):
-                                if part == 'id' and i + 1 < len(parts):
-                                    egress_prog_id = parts[i + 1]
-                                    step4["details"].append(f"  Program ID: {egress_prog_id}")
-                                    break
-                else:
-                    step4["status"] = "WARN"
-                    step4["details"].append(f"⚠ Egress program not attached")
-        except Exception as e:
-            step4["status"] = "FAIL"
-            step4["details"].append(f"✗ Error: {str(e)[:50]}")
-        
-        report["steps"].append(step4)
-        
-        # Step 5: Map Configuration
-        step5 = {"id": 5, "name": "BPF Map Configuration", "status": "PASS", "details": []}
-        try:
-            # Check ingress_map
-            ingress_map_id = self.find_map("ingress_map") if not self.map_id else self.map_id
-            if ingress_map_id:
-                step5["details"].append(f"✓ ingress_map found (ID: {ingress_map_id})")
-                # Count entries
-                result = self._run(["bpftool", "map", "dump", "id", str(ingress_map_id)], check=False)
-                entry_count = result.stdout.count("key:")
-                step5["details"].append(f"  Allowed IPs: {entry_count}")
-            else:
-                step5["status"] = "FAIL"
-                step5["details"].append(f"✗ ingress_map not found")
-            
-            # Check pod state map
-            pod_state_id = self.find_map("ingress_pod_state_map")
-            if pod_state_id:
-                step5["details"].append(f"✓ ingress_pod_state_map found (ID: {pod_state_id})")
-                # Check state values
-                result = self._run(["bpftool", "map", "dump", "id", str(pod_state_id)], check=False)
-                if "00 00 00 00" in result.stdout:
-                    step5["details"].append(f"  Policy mode: POLICIES_APPLIED (deny-by-default)")
-                elif "01 00 00 00" in result.stdout:
-                    step5["status"] = "WARN"
-                    step5["details"].append(f"  ⚠ Policy mode: DEFAULT_ALLOW (permit-all)")
-            else:
-                step5["status"] = "WARN"
-                step5["details"].append(f"⚠ ingress_pod_state_map not found")
-            
-            # Check conntrack map
-            conntrack_id = self.find_map("aws_conntrack_map")
-            if conntrack_id:
-                step5["details"].append(f"✓ aws_conntrack_map found (ID: {conntrack_id})")
-            else:
-                step5["status"] = "WARN"
-                step5["details"].append(f"⚠ aws_conntrack_map not found")
-        except Exception as e:
-            step5["status"] = "FAIL"
-            step5["details"].append(f"✗ Error: {str(e)[:50]}")
-        
-        report["steps"].append(step5)
-        
-        # Step 6: Connectivity Test
-        step6 = {"id": 6, "name": "Connectivity Test", "status": "PASS", "details": []}
-        try:
-            # Test allowed client
-            result = self._run([
-                "ip", "netns", "exec", "ns-allowed",
-                "timeout", "2", "nc", "-zv", "10.0.0.10", "8080"
-            ], check=False)
-            
-            if result.returncode == 0:
-                step6["details"].append(f"✓ Allowed client (10.0.0.20) can connect")
-            elif result.returncode == 124:
-                step6["status"] = "FAIL"
-                step6["details"].append(f"✗ Allowed client (10.0.0.20) BLOCKED (timeout)")
-            elif result.returncode == 1 and "refused" in result.stderr:
-                step6["status"] = "WARN"
-                step6["details"].append(f"⚠ Backend server not running (connection refused)")
-            else:
-                step6["status"] = "FAIL"
-                step6["details"].append(f"✗ Allowed client test failed (exit {result.returncode})")
-            
-            # Test denied client
-            result = self._run([
-                "ip", "netns", "exec", "ns-denied",
-                "timeout", "2", "nc", "-zv", "10.0.0.10", "8080"
-            ], check=False)
-            
-            if result.returncode == 124:
-                step6["details"].append(f"✓ Denied client (10.0.0.30) BLOCKED (timeout)")
-            elif result.returncode == 0:
-                step6["status"] = "FAIL"
-                step6["details"].append(f"✗ Denied client (10.0.0.30) can connect (policy FAIL)")
-            elif result.returncode == 1 and "refused" in result.stderr:
-                step6["status"] = "WARN"
-                step6["details"].append(f"⚠ Backend server not running")
-            else:
-                step6["status"] = "WARN"
-                step6["details"].append(f"⚠ Denied client test inconclusive (exit {result.returncode})")
-        except Exception as e:
-            step6["status"] = "FAIL"
-            step6["details"].append(f"✗ Error: {str(e)[:50]}")
-        
-        report["steps"].append(step6)
-        
-        # Determine overall status
-        for step in report["steps"]:
-            if step["status"] == "FAIL":
-                report["overall_status"] = "FAIL"
-            elif step["status"] == "WARN" and report["overall_status"] != "FAIL":
-                report["overall_status"] = "WARN"
-        
-        # Print formatted output if requested
-        if print_output:
-            # Create summary table
-            table = Table(title="Setup Status Report", show_header=True, header_style="bold magenta")
-            table.add_column("Step", style="cyan", width=3)
-            table.add_column("Name", style="cyan", width=22)
-            table.add_column("Status", width=8)
-            table.add_column("Details", width=60)
-            
-            for step in report["steps"]:
-                status_style = {
-                    "PASS": "[green]✅ PASS[/green]",
-                    "FAIL": "[red]❌ FAIL[/red]",
-                    "WARN": "[yellow]⚠️  WARN[/yellow]"
-                }[step["status"]]
-                
-                details = "\n".join(step["details"])
-                table.add_row(str(step["id"]), step["name"], status_style, details)
-            
-            console.print(table)
-            
-            # Overall status
-            if report["overall_status"] == "PASS":
-                console.print("\n[bold green]✅ Overall Status: PASS[/bold green]")
-            elif report["overall_status"] == "WARN":
-                console.print("\n[bold yellow]⚠️  Overall Status: PASS with warnings[/bold yellow]")
-            else:
-                console.print("\n[bold red]❌ Overall Status: FAIL[/bold red]")
-        
-        return report
+        return self.status_reporter.generate_report(print_output)

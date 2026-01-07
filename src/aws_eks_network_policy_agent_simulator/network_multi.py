@@ -30,9 +30,10 @@ class MultiPodNetworkManager:
     - denied-client pod (blocked from backend)
     """
     
-    def __init__(self):
+    def __init__(self, output=None):
         self.host_bridge = "br-sim"
         self.host_bridge_ip = "10.0.0.1/24"
+        self.output = output  # Optional TUI output log
         
         # Backend pod - the service being protected
         self.backend = PodConfig(
@@ -79,53 +80,60 @@ class MultiPodNetworkManager:
         
         return result
     
+    def _print(self, message: str) -> None:
+        """Print to TUI output log if available, otherwise console."""
+        if self.output:
+            self.output.write(message)
+        else:
+            console.print(message)
+    
     def cleanup(self) -> None:
         """Clean up existing network setup."""
-        console.print("\n[yellow]Cleaning up old network configuration...[/yellow]")
+        self._print("[yellow]Cleaning up old network configuration...[/yellow]")
         
         # Delete all pods
         for pod in self.pods:
             # Delete veth pair
             result = self._run(["ip", "link", "del", pod.veth_host], check=False)
             if result.returncode == 0:
-                console.print(f"  → Removed {pod.veth_host}")
+                self._print(f"[cyan]$ ip link del {pod.veth_host}[/cyan]")
             
             # Delete namespace
             result = self._run(["ip", "netns", "del", pod.namespace], check=False)
             if result.returncode == 0:
-                console.print(f"  → Removed namespace {pod.namespace}")
+                self._print(f"[cyan]$ ip netns del {pod.namespace}[/cyan]")
         
         # Delete bridge
         result = self._run(["ip", "link", "del", self.host_bridge], check=False)
         if result.returncode == 0:
-            console.print(f"  → Removed bridge {self.host_bridge}")
+            self._print(f"[cyan]$ ip link del {self.host_bridge}[/cyan]")
         
-        console.print("[green][OK] Cleanup complete[/green]")
+        self._print("")
     
     def create_bridge(self) -> bool:
         """Create a bridge to connect all pods."""
-        console.print(f"\n[blue]Creating bridge: {self.host_bridge}[/blue]")
+        self._print("[yellow]Creating bridge...[/yellow]")
         
         try:
             self._run(["ip", "link", "add", self.host_bridge, "type", "bridge"])
-            console.print("  → Bridge created")
+            self._print(f"[cyan]$ ip link add {self.host_bridge} type bridge[/cyan]")
             
             self._run(["ip", "addr", "add", self.host_bridge_ip, "dev", self.host_bridge])
-            console.print(f"  → IP assigned: {self.host_bridge_ip}")
+            self._print(f"[cyan]$ ip addr add {self.host_bridge_ip} dev {self.host_bridge}[/cyan]")
             
             self._run(["ip", "link", "set", self.host_bridge, "up"])
-            console.print("  → Bridge UP")
+            self._print(f"[cyan]$ ip link set {self.host_bridge} up[/cyan]")
+            self._print("")
             
-            console.print("[green][OK] Bridge configured[/green]")
             return True
             
         except Exception as e:
-            console.print(f"[red][ERROR] Failed to create bridge: {e}[/red]")
+            self._print(f"[red][ERROR] Failed to create bridge: {e}[/red]")
             return False
     
     def setup_pod(self, pod: PodConfig) -> bool:
         """Setup a single pod with network namespace."""
-        console.print(f"\n[blue]Setting up pod: {pod.name} ({pod.role})[/blue]")
+        self._print(f"[yellow]Setting up {pod.name}...[/yellow]")
         
         try:
             # Create veth pair
@@ -134,20 +142,22 @@ class MultiPodNetworkManager:
                 pod.veth_host, "type", "veth",
                 "peer", "name", pod.veth_pod
             ])
-            console.print(f"  → Veth pair created: {pod.veth_host} <-> {pod.veth_pod}")
+            self._print(f"[cyan]$ ip link add {pod.veth_host} type veth peer name {pod.veth_pod}[/cyan]")
             
             # Connect host side to bridge
             self._run(["ip", "link", "set", pod.veth_host, "master", self.host_bridge])
+            self._print(f"[cyan]$ ip link set {pod.veth_host} master {self.host_bridge}[/cyan]")
+            
             self._run(["ip", "link", "set", pod.veth_host, "up"])
-            console.print(f"  → {pod.veth_host} connected to bridge")
+            self._print(f"[cyan]$ ip link set {pod.veth_host} up[/cyan]")
             
             # Create namespace
             self._run(["ip", "netns", "add", pod.namespace])
-            console.print(f"  → Namespace '{pod.namespace}' created")
+            self._print(f"[cyan]$ ip netns add {pod.namespace}[/cyan]")
             
             # Move pod side to namespace
             self._run(["ip", "link", "set", pod.veth_pod, "netns", pod.namespace])
-            console.print(f"  → {pod.veth_pod} moved to namespace")
+            self._print(f"[cyan]$ ip link set {pod.veth_pod} netns {pod.namespace}[/cyan]")
             
             # Configure inside namespace
             self._run(["ip", "netns", "exec", pod.namespace,
@@ -156,24 +166,23 @@ class MultiPodNetworkManager:
                       "ip", "link", "set", pod.veth_pod, "up"])
             self._run(["ip", "netns", "exec", pod.namespace,
                       "ip", "addr", "add", pod.ip, "dev", pod.veth_pod])
+            self._print(f"[cyan]$ ip netns exec {pod.namespace} ip addr add {pod.ip} dev {pod.veth_pod}[/cyan]")
             
             # Add default route to bridge
             bridge_ip = self.host_bridge_ip.split('/')[0]
             self._run(["ip", "netns", "exec", pod.namespace,
                       "ip", "route", "add", "default", "via", bridge_ip])
+            self._print(f"[cyan]$ ip netns exec {pod.namespace} ip route add default via {bridge_ip}[/cyan]")
+            self._print("")
             
-            console.print(f"  → Pod configured: IP {pod.ip}")
-            console.print(f"[green][OK] Pod {pod.name} ready[/green]")
             return True
             
         except Exception as e:
-            console.print(f"[red][ERROR] Failed to setup pod {pod.name}: {e}[/red]")
+            self._print(f"[red][ERROR] Failed: {pod.name}: {e}[/red]")
             return False
     
     def setup_network(self) -> bool:
         """Setup complete multi-pod network."""
-        console.print("[bold cyan]═══ Multi-Pod Network Setup ═══[/bold cyan]")
-        
         # Cleanup first
         self.cleanup()
         
@@ -186,8 +195,6 @@ class MultiPodNetworkManager:
             if not self.setup_pod(pod):
                 return False
         
-        console.print("\n[bold green][OK] Multi-pod network ready![/bold green]")
-        self.show_network_summary()
         return True
     
     def show_network_summary(self) -> None:

@@ -14,6 +14,7 @@ from textual.reactive import reactive
 from .environment import EnvironmentManager
 from .network_multi import MultiPodNetworkManager
 from .bpf import BPFManager
+from .stacks import get_stack_traces_text, start_tc_stack_capture, stop_tc_stack_capture, is_tc_capture_running
 
 
 class StatusBar(Static):
@@ -236,8 +237,12 @@ class ControlPanel(Container):
             yield Button("Setup Status", id="btn_show_status")
             yield Button("Network Status", id="btn_net_status")
             yield Button("Show Policies", id="btn_show_policies")
-            yield Button("Clear Logs", id="btn_clear_logs")
+            yield Button("Stack Traces", id="btn_show_stacks")
             yield Static("")  # Spacer
+            yield Static("")  # Spacer
+        with Container(classes="button-grid"):
+            yield Button("Clear Output", id="btn_clear_output")
+            yield Button("Clear Trace", id="btn_clear_trace")
             yield Static("")  # Spacer
 
 
@@ -251,20 +256,35 @@ class OutputLog(Container):
     }
     """
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.text_buffer = []  # Store plain text for copying
+    
     def compose(self) -> ComposeResult:
         """Compose the output log."""
-        yield Static("[bold cyan]═══ Command Output ═══[/bold cyan]", classes="panel-title")
+        with Horizontal():
+            yield Static("[bold cyan]═══ Command Output ═══[/bold cyan]", classes="panel-title")
+            yield Button("Save", id="btn_save_output", variant="default")
         yield RichLog(id="output_content", wrap=True, highlight=True, markup=True, max_lines=1000)
     
     def write(self, message: str) -> None:
         """Write a message to the log."""
         log = self.query_one("#output_content", RichLog)
         log.write(message)
+        # Store plain text version (strip Rich markup)
+        import re
+        plain = re.sub(r'\[/?[^\]]+\]', '', message)
+        self.text_buffer.append(plain)
     
     def clear(self) -> None:
         """Clear the log."""
         log = self.query_one("#output_content", RichLog)
         log.clear()
+        self.text_buffer = []
+    
+    def get_text(self) -> str:
+        """Get all text as plain string."""
+        return '\n'.join(self.text_buffer)
     
     def log_success(self, message: str) -> None:
         """Log a success message."""
@@ -323,10 +343,25 @@ class EBPFManagerApp(App):
         border: solid $success;
     }
     
+    OutputLog Horizontal {
+        height: auto;
+        padding: 0 1;
+        background: $surface;
+        align: right middle;
+    }
+    
     OutputLog .panel-title {
+        width: 1fr;
         height: auto;
         padding: 1;
-        background: $surface;
+    }
+    
+    OutputLog Button {
+        width: auto;
+        min-width: 8;
+        height: 1;
+        padding: 0 2;
+        margin: 0 0 0 1;
     }
     
     OutputLog RichLog {
@@ -338,10 +373,21 @@ class EBPFManagerApp(App):
         border: solid $warning;
     }
     
+    TracePipeLog Horizontal {
+        height: auto;
+        width: 100%;
+    }
+    
     TracePipeLog .panel-title {
         height: auto;
         padding: 1;
         background: $surface;
+        width: 1fr;
+    }
+    
+    TracePipeLog Button {
+        height: auto;
+        min-width: 12;
     }
     
     TracePipeLog RichLog {
@@ -395,10 +441,8 @@ class EBPFManagerApp(App):
         super().__init__()
         self.base_dir = Path.cwd()
         self.env_mgr = EnvironmentManager(self.base_dir)
-        self.net_mgr = MultiPodNetworkManager()
-        
-        # BPF manager will attach to backend pod's host-side interface
-        self.bpf_mgr = BPFManager(self.net_mgr.backend.veth_host)
+        self.net_mgr = None  # Will be initialized in on_mount with output log
+        self.bpf_mgr = None  # Will be initialized in on_mount after net_mgr
         
         # Track backend server process
         self.backend_server_proc = None
@@ -422,6 +466,13 @@ class EBPFManagerApp(App):
     async def on_mount(self) -> None:
         """Handle mount event."""
         output = self.query_one("#output_log", OutputLog)
+        
+        # Initialize network manager with output log so it can write to TUI
+        self.net_mgr = MultiPodNetworkManager(output=output)
+        
+        # Initialize BPF manager with backend interface AND output log
+        self.bpf_mgr = BPFManager(self.net_mgr.backend.veth_host, output=output)
+        
         output.write("[bold cyan]AWS EKS Network Policy Agent Simulator[/bold cyan]")
         output.write("[dim]Press 's' to run Setup, or use the buttons below[/dim]")
         output.write("")
@@ -457,7 +508,10 @@ class EBPFManagerApp(App):
             "btn_test_denied": self.test_denied_client,
             "btn_show_status": self.show_status,
             "btn_net_status": self.show_network_status,
-            "btn_clear_logs": self.clear_logs,
+            "btn_clear_output": self.clear_output_log,
+            "btn_clear_trace": self.clear_trace_log,
+            "btn_save_output": self.save_output,
+            "btn_show_stacks": self.show_stack_traces,
         }
         
         handler = handlers.get(button_id)
@@ -468,16 +522,41 @@ class EBPFManagerApp(App):
         """Setup system environment."""
         output = self.query_one("#output_log", OutputLog)
         output.write(f"[bold blue]Step {step_num}: Environment Check[/bold blue]")
-        output.write("[bold yellow]Objective:[/bold yellow] Verify kernel debugfs is mounted")
-        output.write("[cyan]$ mount | grep debugfs[/cyan]")
+        output.write("[bold yellow]Objective:[/bold yellow] Verify root access and required tools")
+        output.write("[cyan]$ whoami[/cyan]")
+        output.write("[cyan]$ which clang bpftool tc ip[/cyan]")
+        output.write("")
         
-        # Run in thread pool to avoid blocking
-        result = await asyncio.to_thread(self.env_mgr.setup_environment)
+        # Check root
+        if not self.env_mgr.check_root():
+            output.log_error("Must run as root (use sudo)")
+            output.write("")
+            return
+        output.write("[green]✓ Running as root[/green]")
         
-        if result:
-            output.log_success("Validation: Environment ready - debugfs mounted")
+        # Check dependencies
+        present, missing = await asyncio.to_thread(self.env_mgr.check_dependencies)
+        
+        for tool in present:
+            output.write(f"[green]✓ {tool} found[/green]")
+        
+        if missing:
+            output.write("")
+            for tool in missing:
+                output.log_error(f"{tool} not found")
+            output.write("[yellow]Run setup.sh to install missing tools[/yellow]")
+            output.write("")
+            return
+        
+        # Check ASM symlink
+        asm_exists = await asyncio.to_thread(lambda: Path("/usr/include/asm").exists())
+        if asm_exists:
+            output.write("[green]✓ ASM headers configured[/green]")
         else:
-            output.log_error("Validation: Environment setup failed")
+            output.write("[yellow]⚠ ASM symlink missing (will create if needed)[/yellow]")
+        
+        output.write("")
+        output.log_success("Validation: All required tools present")
         output.write("")
     
     async def setup_network(self, step_num: int = 2) -> None:
@@ -485,18 +564,33 @@ class EBPFManagerApp(App):
         output = self.query_one("#output_log", OutputLog)
         output.write(f"[bold blue]Step {step_num}: Multi-Pod Network[/bold blue]")
         output.write("[bold yellow]Objective:[/bold yellow] Create 3-pod network (backend, allowed-client, denied-client)")
-        output.write(f"[cyan]$ ip link add {self.net_mgr.host_bridge} type bridge[/cyan]")
-        output.write(f"[cyan]$ ip netns add ns-backend[/cyan]")
-        output.write(f"[cyan]$ ip link add veth-be-h type veth peer name veth-be-p[/cyan]")
-        output.write("[dim]... (similar commands for allowed-client and denied-client pods)[/dim]")
+        output.write("")
+        
+        # Stop backend server before cleaning up network (since cleanup deletes namespaces)
+        if self.backend_server_proc and self.backend_server_proc.poll() is None:
+            output.write("[dim]Stopping existing backend server...[/dim]")
+            self.backend_server_proc.terminate()
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.backend_server_proc.wait),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                self.backend_server_proc.kill()
+        
+        # Clear the process reference since we're recreating the namespace
+        self.backend_server_proc = None
         
         result = await asyncio.to_thread(self.net_mgr.setup_network)
         
         if result:
+            output.write("")
             output.log_success(f"Validation: Multi-pod network configured")
-            output.write(f"[cyan]  Backend: {self.net_mgr.backend.ip.split('/')[0]} (port 8080)[/cyan]")
-            output.write(f"[green]  Allowed: {self.net_mgr.allowed_client.ip.split('/')[0]}[/green]")
-            output.write(f"[red]  Denied: {self.net_mgr.denied_client.ip.split('/')[0]}[/red]")
+            output.write("[bold cyan]Network Summary:[/bold cyan]")
+            output.write(f"  Bridge: {self.net_mgr.host_bridge} ({self.net_mgr.host_bridge_ip})")
+            output.write(f"  Backend: {self.net_mgr.backend.ip.split('/')[0]} (ns-backend, veth-be-h/p, port 8080)")
+            output.write(f"  Allowed: {self.net_mgr.allowed_client.ip.split('/')[0]} (ns-allowed, veth-al-h/p)")
+            output.write(f"  Denied: {self.net_mgr.denied_client.ip.split('/')[0]} (ns-denied, veth-de-h/p)")
             status = self.query_one(StatusBar)
             status.network_ready = True
         else:
@@ -523,10 +617,8 @@ class EBPFManagerApp(App):
         """Load BPF program - delegates to bpf manager."""
         output = self.query_one("#output_log", OutputLog)
         output.write(f"[bold blue]Step {step_num}: Load BPF to Backend[/bold blue]")
-        output.write("[bold yellow]Objective:[/bold yellow] Load and attach eBPF program to backend ingress")
-        output.write(f"[cyan]$ tc qdisc add dev {self.net_mgr.backend.veth_host} clsact[/cyan]")
-        output.write(f"[cyan]$ tc filter add dev {self.net_mgr.backend.veth_host} ingress bpf da obj tc.v4ingress.bpf.o sec tc_cls[/cyan]")
-        output.write(f"[cyan]$ bpftool map update id <pod_state_map_id> key 0x00000000 value 0x01[/cyan]")
+        output.write("[bold yellow]Objective:[/bold yellow] Load and attach ingress & egress eBPF programs")
+        output.write("")
         
         result = await asyncio.to_thread(self.bpf_mgr.load_and_attach)
         
@@ -537,8 +629,29 @@ class EBPFManagerApp(App):
             status = self.query_one(StatusBar)
             status.program_id = self.bpf_mgr.program_id
             status.map_id = self.bpf_mgr.map_id
+            
+            # Start TC-level stack trace capture
+            output.write("")
+            output.write("[bold cyan]═══ Stack Trace Capture (cls_bpf_classify kprobe) ═══[/bold cyan]")
+            output.write("[dim]Attaching kprobe to capture stacks at TC BPF decision point...[/dim]")
+            
+            try:
+                # Stop any existing capture first
+                if is_tc_capture_running():
+                    await asyncio.to_thread(stop_tc_stack_capture)
+                
+                success = await asyncio.to_thread(start_tc_stack_capture)
+                if success:
+                    output.log_success("Stack trace kprobe loaded (cls_bpf_classify)")
+                    output.write("[dim]  Use '📊 Stacks' button to view captured stack traces[/dim]")
+                else:
+                    output.log_error("Failed to load stack trace kprobe")
+                    output.write("[dim]  BCC may not be installed or cls_bpf_classify not available[/dim]")
+            except Exception as e:
+                output.log_error(f"Stack trace kprobe failed: {e}")
         else:
             output.log_error("Validation: Failed to load program")
+        
         output.write("")
     
     async def show_network_status(self) -> None:
@@ -622,10 +735,22 @@ class EBPFManagerApp(App):
         """Start TCP server in backend pod."""
         output = self.query_one("#output_log", OutputLog)
         
+        # Check if we have a running process AND the namespace still exists
         if self.backend_server_proc and self.backend_server_proc.poll() is None:
-            output.log_warning("Backend server already running")
-            output.write("")
-            return
+            # Verify the namespace still exists
+            ns_check = await asyncio.to_thread(
+                subprocess.run,
+                ["ip", "netns", "list"],
+                capture_output=True,
+                text=True
+            )
+            if self.net_mgr.backend.namespace in ns_check.stdout:
+                output.log_warning("Backend server already running")
+                output.write("")
+                return
+            else:
+                # Namespace doesn't exist anymore, clear the stale process
+                self.backend_server_proc = None
         
         output.write(f"[bold blue]Step {step_num}: Start Backend Server[/bold blue]")
         output.write("[bold yellow]Objective:[/bold yellow] Start TCP server on backend pod port 8080")
@@ -798,6 +923,16 @@ class EBPFManagerApp(App):
         else:
             output.write("\n[bold red]❌ Overall Status: FAIL[/bold red]")
         
+        # Stack capture status
+        output.write("\n[bold]Stack Trace Capture:[/bold]")
+        if is_tc_capture_running():
+            output.write("  [green]✓ TC kprobe active (cls_bpf_classify)[/green]")
+            from .stacks import get_stack_capture_stats
+            total, sampled, index = get_stack_capture_stats()
+            output.write(f"  [dim]Stats: {total:,} packets seen, {sampled:,} sampled, {index} in buffer[/dim]")
+        else:
+            output.write("  [yellow]⚠ Not running - click 'Start Capture' or run Setup[/yellow]")
+        
         output.write("")
     
     async def start_trace(self) -> None:
@@ -824,16 +959,51 @@ class EBPFManagerApp(App):
         trace_log.write("[yellow]Trace monitor stopped[/yellow]")
         output.write("")
     
-    async def clear_logs(self) -> None:
-        """Clear all logs."""
+    async def clear_output_log(self) -> None:
+        """Clear command output log only."""
+        output = self.query_one("#output_log", OutputLog)
+        
+        output.clear()
+        output.write("[dim]Command output cleared[/dim]")
+        output.write("")
+    
+    async def clear_trace_log(self) -> None:
+        """Clear network trace log only."""
         output = self.query_one("#output_log", OutputLog)
         trace_log = self.query_one("#trace_log", TracePipeLog)
         
-        output.clear()
         trace_log.clear()
-        
-        output.write("[dim]Logs cleared[/dim]")
+        output.write("[dim]Network trace log cleared[/dim]")
         output.write("")
+    
+    async def save_output(self) -> None:
+        """Save output log to file."""
+        output = self.query_one("#output_log", OutputLog)
+        text = output.get_text()
+        
+        from datetime import datetime
+        filename = f"command_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        with open(filename, 'w') as f:
+            f.write(text)
+        
+        output.log_success(f"Output saved to: {filename}")
+    
+    async def show_stack_traces(self) -> None:
+        """Display kernel stack traces captured by BPF program."""
+        output = self.query_one("#output_log", OutputLog)
+        
+        try:
+            # Get stack traces as plain text
+            result = get_stack_traces_text()
+            
+            if result.strip():
+                for line in result.split('\n'):
+                    output.write(line)
+            else:
+                output.write("No stack traces found. Generate traffic first.")
+        except Exception as e:
+            output.log_error(f"Failed to read stack traces: {e}")
     
     async def action_test_allowed(self) -> None:
         """Action handler for test allowed keyboard shortcut."""

@@ -1,11 +1,22 @@
 #!/bin/bash
 # Setup script for eBPF Manager
 # Installs all required dependencies and tools
+# Supports: Ubuntu/Debian-based systems
 
 set -e
 
 echo "=== eBPF Manager Setup ==="
 echo ""
+
+# Check if running on Ubuntu/Debian
+if ! command -v apt-get &> /dev/null; then
+    echo "Error: This setup script requires Ubuntu/Debian (apt-get not found)"
+    echo "For other distributions, please install dependencies manually:"
+    echo "  - clang, llvm, libbpf-dev, iproute2, bpftool, netcat, xclip"
+    echo "  - linux-headers for your kernel"
+    echo "  - Python 3.8+ with pip"
+    exit 1
+fi
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then 
