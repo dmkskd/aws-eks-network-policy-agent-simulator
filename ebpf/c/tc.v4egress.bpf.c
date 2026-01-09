@@ -100,6 +100,7 @@ struct data_t {
 	__u32  protocol;
 	__u32  verdict;
 	__u32 packet_sz;
+	__u32 runtime_ns;  // Time taken by BPF program in nanoseconds
 	__u8 is_egress;
 	__u8 tier;
 };
@@ -221,7 +222,7 @@ static __always_inline int evaluateNamespacePolicyByLookUp(struct keystruct trie
 	return ACTION_DENY;
 }
 
-static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state) {
+static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntrack_key flow_key, __u8 pod_state_val, struct data_t *evt, int pod_state, __u64 start_time) {
 
 		struct conntrack_value flow_val = {};
 
@@ -231,8 +232,8 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 		int effective_action;
 
 		// DEBUG: Print flow evaluation (IP in hex, ports, protocol)
-		bpf_trace_printk("[EGRESS] Flow: src_ip=0x%x sport=%d\n", sizeof("[EGRESS] Flow: src_ip=0x%x sport=%d\n"), flow_key.src_ip, flow_key.src_port);
-		bpf_trace_printk("[EGRESS]       dst_ip=0x%x dport=%d proto=%d\n", sizeof("[EGRESS]       dst_ip=0x%x dport=%d proto=%d\n"), flow_key.dest_ip, flow_key.dest_port, flow_key.protocol);
+		//bpf_trace_printk("[EGRESS] Flow: src_ip=0x%x sport=%d\n", sizeof("[EGRESS] Flow: src_ip=0x%x sport=%d\n"), flow_key.src_ip, flow_key.src_port);
+		//bpf_trace_printk("[EGRESS]       dst_ip=0x%x dport=%d proto=%d\n", sizeof("[EGRESS]       dst_ip=0x%x dport=%d proto=%d\n"), flow_key.dest_ip, flow_key.dest_port, flow_key.protocol);
 
 		int admin_tier_action = evaluateClusterPolicyByLookUp(trie_key, flow_key, &admin_tier_priority, &baseline_tier_action, &baseline_tier_priority);
 		if (admin_tier_priority <= ADMIN_TIER_PRIORITY_LIMIT) {
@@ -240,19 +241,21 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 			effective_action = admin_tier_action;
 			switch (effective_action) {
 			case ACTION_DENY: {
-				bpf_trace_printk("[EGRESS] ADMIN_TIER: DENY", sizeof("[EGRESS] ADMIN_TIER: DENY"));
+				//bpf_trace_printk("[EGRESS] ADMIN_TIER: DENY", sizeof("[EGRESS] ADMIN_TIER: DENY"));
 				evt->verdict = 0;
 				evt->tier = ADMIN_TIER;
-				// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+				evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+				bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 				return BPF_DROP;
 			}
 			case ACTION_ALLOW: {
-				bpf_trace_printk("[EGRESS] ADMIN_TIER: ALLOW", sizeof("[EGRESS] ADMIN_TIER: ALLOW"));
+				//bpf_trace_printk("[EGRESS] ADMIN_TIER: ALLOW", sizeof("[EGRESS] ADMIN_TIER: ALLOW"));
 				flow_val.val = pod_state_val;
 				bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0);
 				evt->verdict = 1;
 				evt->tier = ADMIN_TIER;
-				// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+				evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+				bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 				return BPF_OK;
 			}
 			default:
@@ -264,56 +267,62 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 
 		switch (verdict){
 		case ACTION_ALLOW:{
-			bpf_trace_printk("[EGRESS] NETWORK_POLICY_TIER: ALLOW", sizeof("[EGRESS] NETWORK_POLICY_TIER: ALLOW"));
+			//bpf_trace_printk("[EGRESS] NETWORK_POLICY_TIER: ALLOW", sizeof("[EGRESS] NETWORK_POLICY_TIER: ALLOW"));
 			flow_val.val = pod_state_val;
 			bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0); // 0 - BPF_ANY
 			evt->verdict = 1;
 			evt->tier = NETWORK_POLICY_TIER;
-			// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+			evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+			bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 			return BPF_OK;
 		}
 		case ACTION_DENY:{
-			bpf_trace_printk("[EGRESS] NETWORK_POLICY_TIER: DENY", sizeof("[EGRESS] NETWORK_POLICY_TIER: DENY"));
+			//bpf_trace_printk("[EGRESS] NETWORK_POLICY_TIER: DENY", sizeof("[EGRESS] NETWORK_POLICY_TIER: DENY"));
 			evt->verdict = 0;
 			evt->tier = NETWORK_POLICY_TIER;
-			// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+			evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+			bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 			return BPF_DROP;
 		}
 		case ACTION_PASS:
 			effective_action = baseline_tier_action;
 			switch (effective_action) {
 			case ACTION_DENY: {
-				bpf_trace_printk("[EGRESS] BASELINE_TIER: DENY", sizeof("[EGRESS] BASELINE_TIER: DENY"));
+				//bpf_trace_printk("[EGRESS] BASELINE_TIER: DENY", sizeof("[EGRESS] BASELINE_TIER: DENY"));
 				evt->verdict = 0;
 				evt->tier = BASELINE_TIER;
-				// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+				evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+				bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 				return BPF_DROP;
 			}
 			case ACTION_ALLOW: {
-				bpf_trace_printk("[EGRESS] BASELINE_TIER: ALLOW", sizeof("[EGRESS] BASELINE_TIER: ALLOW"));
+				//bpf_trace_printk("[EGRESS] BASELINE_TIER: ALLOW", sizeof("[EGRESS] BASELINE_TIER: ALLOW"));
 				flow_val.val = pod_state_val;
 				bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0);
 				evt->verdict = 1;
 				evt->tier = BASELINE_TIER;
-				// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+				evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+				bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 				return BPF_OK;
 			}
 			case ACTION_PASS: {
 				switch (pod_state) {
 				case DEFAULT_ALLOW: {
-					bpf_trace_printk("[EGRESS] DEFAULT_TIER: ALLOW", sizeof("[EGRESS] DEFAULT_TIER: ALLOW"));
+					//bpf_trace_printk("[EGRESS] DEFAULT_TIER: ALLOW", sizeof("[EGRESS] DEFAULT_TIER: ALLOW"));
 					flow_val.val = pod_state_val;
 					bpf_map_update_elem(&aws_conntrack_map, &flow_key, &flow_val, 0);
 					evt->verdict = 1;
 					evt->tier = DEFAULT_TIER;
-					// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+					evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+					bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 					return BPF_OK;
 					}
 				case DEFAULT_DENY: {
-					bpf_trace_printk("[EGRESS] DEFAULT_TIER: DENY", sizeof("[EGRESS] DEFAULT_TIER: DENY"));
+					//bpf_trace_printk("[EGRESS] DEFAULT_TIER: DENY", sizeof("[EGRESS] DEFAULT_TIER: DENY"));
 					evt->verdict = 0;
 					evt->tier = DEFAULT_TIER;
-					// bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
+					evt->runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+					bpf_ringbuf_output(&policy_events, evt, sizeof(*evt), 0);
 					return BPF_DROP;
 					}
 				}
@@ -327,6 +336,9 @@ static __always_inline int evaluateFlow(struct keystruct trie_key, struct conntr
 SEC("tc_cls")
 int handle_egress(struct __sk_buff *skb)
 {
+	// Capture start time for per-packet timing
+	__u64 start_time = bpf_ktime_get_ns();
+
 	struct keystruct trie_key;
 	__u32 l4_src_port = 0;
 	__u32 l4_dst_port = 0;
@@ -426,16 +438,17 @@ int handle_egress(struct __sk_buff *skb)
 
 		// There should always be an entry in pod_state_map. pst returned in above line should never be null.
 		if ((pst == NULL) || (clusterpolicy_pst == NULL)) {
-			bpf_trace_printk("[EGRESS] ERROR: pod_state_map not initialized", sizeof("[EGRESS] ERROR: pod_state_map not initialized"));
+			//bpf_trace_printk("[EGRESS] ERROR: pod_state_map not initialized", sizeof("[EGRESS] ERROR: pod_state_map not initialized"));
 			evt.verdict = 0;
 			evt.tier = ERROR_TIER;
-			// bpf_ringbuf_output(&policy_events, &evt, sizeof(evt), 0);
+			evt.runtime_ns = (__u32)(bpf_ktime_get_ns() - start_time);
+			bpf_ringbuf_output(&policy_events, &evt, sizeof(evt), 0);
 			return BPF_DROP;
 		}
 
 		__u8 ct_pod_state_val = GET_CT_VAL(pst->state, clusterpolicy_pst->state);
 
-		bpf_trace_printk("[EGRESS] Packet: src=0x%x dst=0x%x proto=%d\n", sizeof("[EGRESS] Packet: src=0x%x dst=0x%x proto=%d\n"), flow_key.src_ip, flow_key.dest_ip, flow_key.protocol);
+		//bpf_trace_printk("[EGRESS] Packet: src=0x%x dst=0x%x proto=%d\n", sizeof("[EGRESS] Packet: src=0x%x dst=0x%x proto=%d\n"), flow_key.src_ip, flow_key.dest_ip, flow_key.protocol);
 
 		// Check if it's an existing flow
 		flow_val = bpf_map_lookup_elem(&aws_conntrack_map, &flow_key);
@@ -443,14 +456,14 @@ int handle_egress(struct __sk_buff *skb)
 		if (flow_val != NULL) {
 			// If the pod state matches, allow the packet
 			if (flow_val->val == ct_pod_state_val) {
-				bpf_trace_printk("[EGRESS] Existing flow matched", sizeof("[EGRESS] Existing flow matched"));
+				//bpf_trace_printk("[EGRESS] Existing flow matched", sizeof("[EGRESS] Existing flow matched"));
 				return BPF_OK;
 			}
 
 			// Evaluate the flow again if the pod state has changed and take the decision based on it
 			if (flow_val->val != ct_pod_state_val) {
-				bpf_trace_printk("[EGRESS] Pod state changed, re-evaluating", sizeof("[EGRESS] Pod state changed, re-evaluating"));
-				int ret = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+				//bpf_trace_printk("[EGRESS] Pod state changed, re-evaluating", sizeof("[EGRESS] Pod state changed, re-evaluating"));
+				int ret = evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state, start_time);
 				if (ret == BPF_DROP) {
 					bpf_map_delete_elem(&aws_conntrack_map, &flow_key);
 					return BPF_DROP;
@@ -471,13 +484,13 @@ int handle_egress(struct __sk_buff *skb)
 		reverse_flow_val = bpf_map_lookup_elem(&aws_conntrack_map, &reverse_flow_key);
 
 		if (reverse_flow_val != NULL) {
-			bpf_trace_printk("[EGRESS] Reverse flow matched (response)", sizeof("[EGRESS] Reverse flow matched (response)"));
+			//bpf_trace_printk("[EGRESS] Reverse flow matched (response)", sizeof("[EGRESS] Reverse flow matched (response)"));
 			return BPF_OK;
 		}
 
-		bpf_trace_printk("[EGRESS] New flow - evaluating policy\n", sizeof("[EGRESS] New flow - evaluating policy\n"));
+		//bpf_trace_printk("[EGRESS] New flow - evaluating policy\n", sizeof("[EGRESS] New flow - evaluating policy\n"));
 		// If we reach here, it means it's a new flow or a non-matching response
-		return evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state);
+		return evaluateFlow(trie_key, flow_key, ct_pod_state_val, &evt, pst->state, start_time);
 	}
 	return BPF_OK;
 }

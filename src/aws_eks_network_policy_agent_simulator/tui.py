@@ -16,6 +16,7 @@ from .network_multi import MultiPodNetworkManager
 from .bpf import BPFManager
 from .bpfstats import BPFStatsCollector, BPFProgramStats
 from .stacks import get_stack_traces_text, start_tc_stack_capture, stop_tc_stack_capture, is_tc_capture_running
+from .ringbuf import AsyncRingBufferConsumer, PolicyEvent
 
 
 class BPFStatsMonitor(Container):
@@ -363,6 +364,149 @@ class TracePipeLog(Container):
             self.trace_proc = None
 
 
+class RingBufferLog(Container):
+    """Live log viewer for BPF ring buffer events.
+    
+    Consumes structured events from the policy_events ring buffer using
+    the ringbuf_consumer C helper. This provides better formatting than
+    trace_pipe since events are structured JSON.
+    """
+    
+    DEFAULT_CSS = """
+    RingBufferLog {
+        layout: vertical;
+        height: 100%;
+    }
+    """
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.consumer: Optional[AsyncRingBufferConsumer] = None
+        self.read_task: Optional[asyncio.Task] = None
+        self.event_count = 0
+        self.allow_count = 0
+        self.deny_count = 0
+    
+    def compose(self) -> ComposeResult:
+        """Compose the ring buffer log."""
+        yield Static("[bold cyan]═══ Ring Buffer Events (policy_events) ═══[/bold cyan]", classes="panel-title")
+        yield RichLog(id="ringbuf_content", wrap=False, highlight=True, markup=True, max_lines=1000)
+    
+    def write(self, message: str) -> None:
+        """Write a message to the log."""
+        try:
+            log = self.query_one("#ringbuf_content", RichLog)
+            log.write(message)
+        except Exception:
+            pass
+    
+    def clear(self) -> None:
+        """Clear the log."""
+        try:
+            log = self.query_one("#ringbuf_content", RichLog)
+            log.clear()
+        except Exception:
+            pass
+    
+    async def start_consumer(self) -> None:
+        """Start consuming ring buffer events."""
+        self.clear()
+        self.event_count = 0
+        self.allow_count = 0
+        self.deny_count = 0
+        
+        self.consumer = AsyncRingBufferConsumer()
+        
+        if not self.consumer.consumer_exists:
+            self.write("[yellow]Ring buffer consumer not found.[/yellow]")
+            self.write(f"[dim]Expected at: {self.consumer.CONSUMER_PATH}[/dim]")
+            self.write("[dim]Compile with: clang -o ringbuf_consumer ringbuf_consumer.c -lbpf[/dim]")
+            return
+        
+        self.write("[dim]Starting ring buffer consumer...[/dim]")
+        
+        if not await self.consumer.start():
+            self.write("[red]Failed to start consumer. Is the BPF program loaded?[/red]")
+            return
+        
+        self.write("[green]Connected to policy_events ring buffer[/green]")
+        self.write("[cyan]Listening for policy events... (send traffic to see output)[/cyan]")
+        self.write("[dim]Pod IPs: Backend=10.0.0.10, Allowed=10.0.0.20, Denied=10.0.0.30[/dim]")
+        self.write("")
+        
+        # Start reading events
+        self.read_task = asyncio.create_task(self._read_loop())
+    
+    async def _read_loop(self) -> None:
+        """Read events from the ring buffer."""
+        # Filter to only show events involving our pod IPs
+        pod_ips = {"10.0.0.10", "10.0.0.20", "10.0.0.30"}
+        
+        try:
+            async for event in self.consumer.read_events():
+                # Filter: only show events where src or dest is one of our pods
+                if event.src_ip not in pod_ips and event.dest_ip not in pod_ips:
+                    continue
+                
+                self.event_count += 1
+                self._format_event(event)
+                
+                # Show stats periodically
+                if self.event_count % 50 == 0:
+                    self.write(f"[dim]--- {self.event_count} events (ALLOW:{self.allow_count} DENY:{self.deny_count}) ---[/dim]")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.write(f"[red]Error reading events: {e}[/red]")
+    
+    def _format_event(self, event: PolicyEvent) -> None:
+        """Format and display an event."""
+        # Build formatted string
+        direction = f"[magenta]{event.direction:8}[/magenta]" if event.is_egress else f"[blue]{event.direction:8}[/blue]"
+        
+        if event.verdict_str == "ALLOW":
+            self.allow_count += 1
+            verdict = "[green]ALLOW[/green]"
+            symbol = "[green]✓[/green]"
+        else:
+            self.deny_count += 1
+            verdict = "[red]DENY[/red]"
+            symbol = "[red]✗[/red]"
+        
+        # Highlight based on known IPs
+        src_color = "green" if "10.0.0.20" in event.src_ip else ("red" if "10.0.0.30" in event.src_ip else "white")
+        dest_color = "yellow" if "10.0.0.10" in event.dest_ip else "white"
+        
+        src = f"[{src_color}]{event.src_ip}:{event.src_port}[/{src_color}]"
+        dest = f"[{dest_color}]{event.dest_ip}:{event.dest_port}[/{dest_color}]"
+        
+        # Format runtime in microseconds
+        runtime_us = event.runtime_ns / 1000.0
+        runtime_str = f"[cyan]{runtime_us:>6.1f}µs[/cyan]"
+        
+        msg = f"{symbol} {direction} {verdict} {src} → {dest} ({event.protocol_name}) {runtime_str}"
+        self.write(msg)
+    
+    async def stop_consumer(self) -> None:
+        """Stop the ring buffer consumer."""
+        if self.read_task:
+            self.read_task.cancel()
+            try:
+                await self.read_task
+            except asyncio.CancelledError:
+                pass
+            self.read_task = None
+        
+        if self.consumer:
+            await self.consumer.stop()
+            self.consumer = None
+        
+        try:
+            self.write("[dim]Ring buffer consumer stopped[/dim]")
+        except Exception:
+            pass
+
+
 class ControlPanel(Container):
     """Control panel with buttons for actions."""
     
@@ -557,6 +701,22 @@ class EBPFManagerApp(App):
         height: 1fr;
     }
     
+    RingBufferLog {
+        height: 1fr;
+        border: solid $success;
+    }
+    
+    RingBufferLog .panel-title {
+        height: auto;
+        padding: 1;
+        background: $surface;
+        width: 1fr;
+    }
+    
+    RingBufferLog RichLog {
+        height: 1fr;
+    }
+    
     StatusBar {
         height: auto;
         background: $primary-darken-2;
@@ -621,7 +781,7 @@ class EBPFManagerApp(App):
             yield ControlPanel(id="control_panel")
             with Vertical(id="right_panel"):
                 yield OutputLog(id="output_log")
-                yield TracePipeLog(id="trace_log")
+                yield RingBufferLog(id="ringbuf_log")
                 yield BPFStatsMonitor(id="bpf_stats")
         
         yield StatusBar()
@@ -649,9 +809,7 @@ class EBPFManagerApp(App):
             output.log_success("Running as root")
             output.write("")
             
-            # Auto-start kernel trace monitor
-            trace_log = self.query_one("#trace_log", TracePipeLog)
-            trace_log.trace_task = asyncio.create_task(trace_log.start_trace())
+            # Ring buffer consumer will be started after BPF programs are loaded
         
         # Small delay to ensure widgets are mounted
         await asyncio.sleep(0.1)
@@ -665,10 +823,10 @@ class EBPFManagerApp(App):
         except Exception:
             pass
         
-        # Stop trace pipe
+        # Stop ring buffer consumer
         try:
-            trace_log = self.query_one("#trace_log", TracePipeLog)
-            trace_log.stop_trace()
+            ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
+            await ringbuf_log.stop_consumer()
         except Exception:
             pass
         
@@ -1149,27 +1307,26 @@ class EBPFManagerApp(App):
         output.write("")
     
     async def start_trace(self) -> None:
-        """Start/restart trace monitor."""
-        trace_log = self.query_one("#trace_log", TracePipeLog)
+        """Start/restart ring buffer consumer."""
+        ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
         output = self.query_one("#output_log", OutputLog)
         
-        if trace_log.trace_task and not trace_log.trace_task.done():
-            output.log_info("Restarting trace monitor...")
-            trace_log.stop_trace()
+        if ringbuf_log.consumer and ringbuf_log.read_task:
+            output.log_info("Restarting ring buffer consumer...")
+            await ringbuf_log.stop_consumer()
         else:
-            output.log_info("Starting trace monitor...")
+            output.log_info("Starting ring buffer consumer...")
         
-        trace_log.trace_task = asyncio.create_task(trace_log.start_trace())
+        await ringbuf_log.start_consumer()
         output.write("")
     
     async def stop_trace(self) -> None:
-        """Stop trace monitor."""
-        trace_log = self.query_one("#trace_log", TracePipeLog)
+        """Stop ring buffer consumer."""
+        ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
         output = self.query_one("#output_log", OutputLog)
         
-        output.log_info("Stopping trace monitor...")
-        trace_log.stop_trace()
-        trace_log.write("[yellow]Trace monitor stopped[/yellow]")
+        output.log_info("Stopping ring buffer consumer...")
+        await ringbuf_log.stop_consumer()
         output.write("")
     
     async def clear_output_log(self) -> None:
@@ -1181,12 +1338,12 @@ class EBPFManagerApp(App):
         output.write("")
     
     async def clear_trace_log(self) -> None:
-        """Clear network trace log only."""
+        """Clear ring buffer event log only."""
         output = self.query_one("#output_log", OutputLog)
-        trace_log = self.query_one("#trace_log", TracePipeLog)
+        ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
         
-        trace_log.clear()
-        output.write("[dim]Network trace log cleared[/dim]")
+        ringbuf_log.clear()
+        output.write("[dim]Ring buffer event log cleared[/dim]")
         output.write("")
     
     async def save_output(self) -> None:
@@ -1321,15 +1478,22 @@ class EBPFManagerApp(App):
         self.setup_completed = True
         self.query_one("#btn_test_allowed", Button).disabled = False
         self.query_one("#btn_test_denied", Button).disabled = False
+        
+        # Start ring buffer consumer now that BPF is loaded
+        try:
+            ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
+            await ringbuf_log.start_consumer()
+        except Exception as e:
+            output.write(f"[yellow]Ring buffer: {e}[/yellow]")
     
     async def action_toggle_trace(self) -> None:
-        """Toggle trace monitor."""
-        trace_log = self.query_one("#trace_log", TracePipeLog)
+        """Toggle ring buffer consumer."""
+        ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
         
-        if trace_log.trace_task and not trace_log.trace_task.done():
-            await self.stop_trace()
+        if ringbuf_log.consumer and ringbuf_log.read_task:
+            await ringbuf_log.stop_consumer()
         else:
-            await self.start_trace()
+            await ringbuf_log.start_consumer()
     
     async def action_quit(self) -> None:
         """Clean up and quit the application."""
@@ -1347,10 +1511,10 @@ class EBPFManagerApp(App):
         except Exception:
             pass
         
-        # Stop trace pipe
+        # Stop ring buffer consumer
         try:
-            trace_log = self.query_one("#trace_log", TracePipeLog)
-            trace_log.stop_trace()
+            ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
+            await ringbuf_log.stop_consumer()
         except Exception:
             pass
         

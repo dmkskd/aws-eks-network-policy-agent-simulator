@@ -23,6 +23,9 @@ env/
 *.bpf.o
 ebpf/c/*.o
 
+# Ring buffer consumer executable
+ebpf/c/ringbuf_consumer
+
 # Logs
 *.log
 nohup.out

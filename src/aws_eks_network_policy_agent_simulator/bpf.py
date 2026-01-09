@@ -244,7 +244,8 @@ class BPFManager:
             "cp_ingress_map", 
             "ingress_pod_state_map",
             "aws_conntrack_map",
-            "stack_traces"
+            "stack_traces",
+            "policy_events",  # Ring buffer for event streaming
         ]
         
         for map_name in map_names:
@@ -334,6 +335,9 @@ class BPFManager:
                 
                 # Cache ingress_map ID for later use (silent)
                 self.map_id = self.find_map("ingress_map", silent=True)
+                
+                # Pin the ring buffer for event streaming
+                self.pin_ringbuf_map()
                 self._print("")
             
             return True
@@ -406,6 +410,41 @@ class BPFManager:
                 self._print(f"[red][ERROR] Error finding map: {e}[/red]")
             return None
     
+    def pin_ringbuf_map(self, pin_path: str = "/sys/fs/bpf/policy_events") -> bool:
+        """Pin the policy_events ring buffer map for userspace consumption.
+        
+        The ring buffer must be pinned so that the ringbuf_consumer C program
+        can access it to stream events to the TUI.
+        """
+        try:
+            # First check if already pinned
+            result = self._run(["test", "-e", pin_path], check=False)
+            if result.returncode == 0:
+                self._print(f"[dim]Ring buffer already pinned at {pin_path}[/dim]")
+                return True
+            
+            # Find the ring buffer map ID
+            map_id = self.find_map("policy_events", silent=True)
+            if not map_id:
+                self._print("[yellow][WARN] policy_events ring buffer not found[/yellow]")
+                return False
+            
+            # Pin the map
+            cmd = ["bpftool", "map", "pin", "id", str(map_id), pin_path]
+            self._print(f"[cyan]$ bpftool map pin id {map_id} {pin_path}[/cyan]")
+            result = self._run(cmd, check=False)
+            
+            if result.returncode == 0:
+                self._print(f"[dim]Ring buffer pinned for event streaming[/dim]")
+                return True
+            else:
+                self._print(f"[yellow][WARN] Failed to pin ring buffer: {result.stderr}[/yellow]")
+                return False
+                
+        except Exception as e:
+            self._print(f"[yellow][WARN] Error pinning ring buffer: {e}[/yellow]")
+            return False
+
     def initialize_pod_state_maps(self) -> bool:
         """Initialize the ingress_pod_state_map and egress_pod_state_map with default values.
         
