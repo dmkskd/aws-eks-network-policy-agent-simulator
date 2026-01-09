@@ -16,7 +16,7 @@ from .network_multi import MultiPodNetworkManager
 from .bpf import BPFManager
 from .bpfstats import BPFStatsCollector, BPFProgramStats
 from .stacks import get_stack_traces_text, start_tc_stack_capture, stop_tc_stack_capture, is_tc_capture_running
-from .ringbuf import AsyncRingBufferConsumer, PolicyEvent
+from .ringbuf_libbpf import AsyncLibbpfRingBufferConsumer as AsyncRingBufferConsumer, PolicyEvent
 
 
 class BPFStatsMonitor(Container):
@@ -410,6 +410,11 @@ class RingBufferLog(Container):
     
     async def start_consumer(self) -> None:
         """Start consuming ring buffer events."""
+        # Stop any existing consumer first (important for re-setup)
+        if self.consumer or self.read_task:
+            self.write("[dim]Stopping existing consumer...[/dim]")
+            await self.stop_consumer()
+        
         self.clear()
         self.event_count = 0
         self.allow_count = 0
@@ -417,15 +422,20 @@ class RingBufferLog(Container):
         
         self.consumer = AsyncRingBufferConsumer()
         
+        self.write(f"[dim]libbpf available: {self.consumer.consumer_exists}[/dim]")
+        self.write(f"[dim]map exists: {self.consumer.map_exists}[/dim]")
+        
         if not self.consumer.consumer_exists:
-            self.write("[yellow]Ring buffer consumer not found.[/yellow]")
-            self.write(f"[dim]Expected at: {self.consumer.CONSUMER_PATH}[/dim]")
-            self.write("[dim]Compile with: clang -o ringbuf_consumer ringbuf_consumer.c -lbpf[/dim]")
+            self.write("[yellow]libbpf not available.[/yellow]")
+            self.write("[dim]Make sure libbpf.so.1 is installed.[/dim]")
             return
         
-        self.write("[dim]Starting ring buffer consumer...[/dim]")
+        self.write("[dim]Starting ring buffer consumer (libbpf)...[/dim]")
         
-        if not await self.consumer.start():
+        started = await self.consumer.start()
+        self.write(f"[dim]consumer.start() returned: {started}[/dim]")
+        
+        if not started:
             self.write("[red]Failed to start consumer. Is the BPF program loaded?[/red]")
             return
         

@@ -335,9 +335,6 @@ class BPFManager:
                 
                 # Cache ingress_map ID for later use (silent)
                 self.map_id = self.find_map("ingress_map", silent=True)
-                
-                # Pin the ring buffer for event streaming
-                self.pin_ringbuf_map()
                 self._print("")
             
             return True
@@ -379,13 +376,39 @@ class BPFManager:
     def find_map(self, map_name: str = "ingress_map", silent: bool = False) -> Optional[int]:
         """Find BPF map by name and return its ID.
         
+        If we have a loaded program, search its maps first.
+        Otherwise fall back to searching all maps.
+        
         Note: BPF map names are truncated to 15 characters (BPF_OBJ_NAME_LEN).
         """
         try:
-            result = self._run(["bpftool", "map", "list"])
-            
             # BPF map names are limited to 15 chars, so truncate for comparison
             search_name = map_name[:15]
+            
+            # If we have a loaded program, get maps from it directly
+            if self.program_id:
+                prog_result = self._run(["bpftool", "prog", "show", "id", str(self.program_id)], check=False)
+                if prog_result.returncode == 0 and "map_ids" in prog_result.stdout:
+                    # Extract map_ids from output like "map_ids 39,895,40,41,42"
+                    for line in prog_result.stdout.split('\n'):
+                        if 'map_ids' in line:
+                            # Parse map IDs
+                            import re
+                            match = re.search(r'map_ids\s+([\d,]+)', line)
+                            if match:
+                                map_ids = [int(x) for x in match.group(1).split(',')]
+                                # Check each map for the name we want
+                                for mid in map_ids:
+                                    map_info = self._run(["bpftool", "map", "show", "id", str(mid)], check=False)
+                                    if map_info.returncode == 0 and f" name {search_name} " in map_info.stdout:
+                                        if map_name == "ingress_map":
+                                            self.map_id = mid
+                                        if not silent:
+                                            self._print(f"[dim]Found map '{map_name}' with ID: {mid} (from program {self.program_id})[/dim]")
+                                        return mid
+            
+            # Fallback: search all maps
+            result = self._run(["bpftool", "map", "list"])
             
             lines = result.stdout.split('\n')
             for i, line in enumerate(lines):
@@ -415,15 +438,18 @@ class BPFManager:
         
         The ring buffer must be pinned so that the ringbuf_consumer C program
         can access it to stream events to the TUI.
+        
+        Always removes any existing pin and re-pins the current program's map
+        to ensure we're using the correct map after re-setup.
         """
         try:
-            # First check if already pinned
+            # Always remove stale pin first
             result = self._run(["test", "-e", pin_path], check=False)
             if result.returncode == 0:
-                self._print(f"[dim]Ring buffer already pinned at {pin_path}[/dim]")
-                return True
+                self._print(f"[dim]Removing existing pinned map at {pin_path}[/dim]")
+                self._run(["rm", "-f", pin_path], check=False)
             
-            # Find the ring buffer map ID
+            # Find the ring buffer map ID from the currently loaded program
             map_id = self.find_map("policy_events", silent=True)
             if not map_id:
                 self._print("[yellow][WARN] policy_events ring buffer not found[/yellow]")
@@ -858,6 +884,9 @@ class BPFManager:
         
         if not self.verify_program():
             return False
+        
+        # Pin ring buffer AFTER verify_program sets program_id
+        self.pin_ringbuf_map()
         
         # Load egress program if available (K8s Egress policy - checks DESTINATION IP)
         if self.egress_obj_file and self.egress_obj_file.exists():
