@@ -332,7 +332,13 @@ class RingBufferLog(Container):
         runtime_us = event.runtime_ns / 1000.0
         runtime_str = f"[cyan]{runtime_us:>6.1f}µs[/cyan]"
         
-        msg = f"{symbol} {direction} {verdict} {src} → {dest} ({event.protocol_name}) {runtime_str}"
+        # Format tier
+        tier_str = f"[dim]tier={event.tier_name}[/dim]"
+        
+        # Format packet size
+        size_str = f"[dim]{event.packet_size}B[/dim]"
+        
+        msg = f"{symbol} {direction} {verdict} {src} → {dest} ({event.protocol_name}) {tier_str} {size_str} {runtime_str}"
         self.write(msg)
     
     async def stop_consumer(self) -> None:
@@ -392,13 +398,10 @@ class ControlPanel(Container):
             yield Button("Setup Status", id="btn_show_status")
             yield Button("Network Status", id="btn_net_status")
             yield Button("Show Policies", id="btn_show_policies")
-            yield Button("Stack Traces", id="btn_show_stacks")
-            yield Static("")  # Spacer
-            yield Static("")  # Spacer
         with Container(classes="button-grid"):
+            yield Button("Stack Traces", id="btn_show_stacks")
             yield Button("Clear Output", id="btn_clear_output")
             yield Button("Clear Events", id="btn_clear_events")
-            yield Static("")  # Spacer
 
 
 class OutputLog(Container):
