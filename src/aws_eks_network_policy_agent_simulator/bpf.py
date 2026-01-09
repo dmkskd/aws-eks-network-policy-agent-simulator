@@ -436,7 +436,7 @@ class BPFManager:
     def pin_ringbuf_map(self, pin_path: str = "/sys/fs/bpf/policy_events") -> bool:
         """Pin the policy_events ring buffer map for userspace consumption.
         
-        The ring buffer must be pinned so that the ringbuf_consumer C program
+        The ring buffer must be pinned so that the Python libbpf consumer
         can access it to stream events to the TUI.
         
         Always removes any existing pin and re-pins the current program's map

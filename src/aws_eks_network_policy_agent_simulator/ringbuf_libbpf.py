@@ -384,26 +384,18 @@ class AsyncLibbpfRingBufferConsumer:
     
     async def start(self) -> bool:
         """Start the ring buffer consumer."""
-        import sys
-        print(f"[ringbuf] start() called, libbpf={libbpf is not None}, map_exists={self.map_exists}", file=sys.stderr)
-        
         if not libbpf or not self.map_exists:
-            print(f"[ringbuf] returning False - libbpf or map missing", file=sys.stderr)
             return False
         
         try:
             self._consumer = LibbpfRingBufferConsumer(self.map_path)
-            print(f"[ringbuf] created consumer, calling open()...", file=sys.stderr)
             
             if not self._consumer.open():
-                print(f"[ringbuf] open() failed", file=sys.stderr)
                 return False
             
-            print(f"[ringbuf] open() succeeded, fd={self._consumer._map_fd}", file=sys.stderr)
             self._running = True
             return True
-        except Exception as e:
-            print(f"[ringbuf] exception: {e}", file=sys.stderr)
+        except Exception:
             return False
     
     async def stop(self) -> None:

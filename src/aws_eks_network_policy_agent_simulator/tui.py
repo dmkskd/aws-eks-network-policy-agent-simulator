@@ -210,166 +210,12 @@ class StatusBar(Static):
         return " | ".join(parts)
 
 
-class TracePipeLog(Container):
-    """Live log viewer for kernel trace output.
-    
-    Monitors /sys/kernel/debug/tracing/trace_pipe which is the kernel's
-    unified tracing interface (ftrace). Shows output from:
-    - BPF programs using bpf_trace_printk()
-    - Kernel tracepoints
-    - kprobes/uprobes
-    - Function tracing
-    """
-    
-    DEFAULT_CSS = """
-    TracePipeLog {
-        layout: vertical;
-        height: 100%;
-    }
-    """
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.trace_task: Optional[asyncio.Task] = None
-        self.trace_proc: Optional[subprocess.Popen] = None
-        self.event_count = 0
-    
-    def compose(self) -> ComposeResult:
-        """Compose the trace log."""
-        yield Static("[bold yellow]═══ Kernel Trace Monitor (/sys/kernel/debug/tracing/trace_pipe) ═══[/bold yellow]", classes="panel-title")
-        yield RichLog(id="trace_content", wrap=False, highlight=True, markup=True, max_lines=1000)
-    
-    def write(self, message: str) -> None:
-        """Write a message to the trace log."""
-        log = self.query_one("#trace_content", RichLog)
-        log.write(message)
-    
-    def clear(self) -> None:
-        """Clear the trace log."""
-        log = self.query_one("#trace_content", RichLog)
-        log.clear()
-    
-    async def start_trace(self) -> None:
-        """Start reading from trace_pipe."""
-        self.clear()
-        self.event_count = 0
-        
-        self.write("[dim]Starting trace_pipe monitor...[/dim]")
-        
-        # First kill any existing readers
-        await asyncio.to_thread(
-            subprocess.run,
-            ["sudo", "pkill", "-f", "trace_pipe"],
-            capture_output=True
-        )
-        await asyncio.sleep(0.5)
-        
-        try:
-            # Use asyncio.create_subprocess_exec for non-blocking IO
-            self.trace_proc = await asyncio.create_subprocess_exec(
-                "sudo", "cat", "/sys/kernel/debug/tracing/trace_pipe",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            self.write("[green][OK] Connected to trace_pipe[/green]")
-            self.write("[cyan]Listening for BPF events... (send traffic to see output)[/cyan]")
-            self.write("[dim]Pod IPs: Backend=10.0.0.10 (0xa00000a), Allowed=10.0.0.20 (0x1400000a), Denied=10.0.0.30 (0x1e00000a)[/dim]")
-            self.write("")
-            
-            # IP decode map (hex to readable)
-            ip_map = {
-                "0xa00000a": "10.0.0.10 (backend)",
-                "0x1400000a": "10.0.0.20 (allowed)",
-                "0x1e00000a": "10.0.0.30 (denied)",
-            }
-            
-            # Read lines asynchronously without blocking
-            while True:
-                try:
-                    line = await asyncio.wait_for(
-                        self.trace_proc.stdout.readline(),
-                        timeout=0.1
-                    )
-                    if line:
-                        decoded = line.decode().rstrip()
-                        self.event_count += 1
-                        
-                        # Decode IPs in the trace
-                        display_line = decoded
-                        for hex_ip, readable in ip_map.items():
-                            if hex_ip in display_line:
-                                display_line = display_line.replace(hex_ip, readable)
-                        
-                        # Highlight based on content
-                        if "ALLOW" in display_line and "10.0.0.20" in display_line:
-                            # Allowed client - expected to pass
-                            self.write(f"[green]✓ {display_line}[/green]")
-                        elif "DENY" in display_line and "10.0.0.30" in display_line:
-                            # Denied client - expected to be blocked
-                            self.write(f"[red]✗ {display_line}[/red]")
-                        elif "EGRESS" in display_line or "Egress" in display_line:
-                            # Egress program output - show in magenta to distinguish
-                            self.write(f"[magenta]{display_line}[/magenta]")
-                        elif "ALLOW" in display_line or "DENY" in display_line or "TIER" in display_line:
-                            # Other policy decisions
-                            self.write(f"[yellow]{display_line}[/yellow]")
-                        elif "Packet:" in display_line or "Flow:" in display_line:
-                            # Packet/flow info
-                            self.write(f"[cyan]{display_line}[/cyan]")
-                        else:
-                            self.write(f"[dim]{display_line}[/dim]")
-                        
-                        # Show event count periodically
-                        if self.event_count % 50 == 0:
-                            self.write(f"[dim]--- {self.event_count} events captured ---[/dim]")
-                    else:
-                        # EOF reached
-                        break
-                except asyncio.TimeoutError:
-                    # No data, check if process is still running
-                    if self.trace_proc.returncode is not None:
-                        break
-                    continue
-                except asyncio.CancelledError:
-                    break
-            
-            try:
-                self.write("[dim]Trace monitor stopped[/dim]")
-            except Exception:
-                pass
-                
-        except PermissionError:
-            try:
-                self.write("[red][ERROR] Permission denied[/red]")
-                self.write("[yellow]Run as root to access trace_pipe[/yellow]")
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                self.write(f"[red][ERROR] Error: {e}[/red]")
-            except Exception:
-                pass
-    
-    def stop_trace(self) -> None:
-        """Stop reading from trace_pipe."""
-        if self.trace_task:
-            self.trace_task.cancel()
-            self.trace_task = None
-        if self.trace_proc:
-            try:
-                self.trace_proc.terminate()
-            except:
-                pass
-            self.trace_proc = None
-
-
 class RingBufferLog(Container):
     """Live log viewer for BPF ring buffer events.
     
     Consumes structured events from the policy_events ring buffer using
-    the ringbuf_consumer C helper. This provides better formatting than
-    trace_pipe since events are structured JSON.
+    libbpf via Python ctypes. Events are displayed with formatting showing
+    verdict, direction, source/destination, and timing.
     """
     
     DEFAULT_CSS = """
@@ -422,20 +268,12 @@ class RingBufferLog(Container):
         
         self.consumer = AsyncRingBufferConsumer()
         
-        self.write(f"[dim]libbpf available: {self.consumer.consumer_exists}[/dim]")
-        self.write(f"[dim]map exists: {self.consumer.map_exists}[/dim]")
-        
         if not self.consumer.consumer_exists:
             self.write("[yellow]libbpf not available.[/yellow]")
             self.write("[dim]Make sure libbpf.so.1 is installed.[/dim]")
             return
         
-        self.write("[dim]Starting ring buffer consumer (libbpf)...[/dim]")
-        
-        started = await self.consumer.start()
-        self.write(f"[dim]consumer.start() returned: {started}[/dim]")
-        
-        if not started:
+        if not await self.consumer.start():
             self.write("[red]Failed to start consumer. Is the BPF program loaded?[/red]")
             return
         
@@ -559,7 +397,7 @@ class ControlPanel(Container):
             yield Static("")  # Spacer
         with Container(classes="button-grid"):
             yield Button("Clear Output", id="btn_clear_output")
-            yield Button("Clear Trace", id="btn_clear_trace")
+            yield Button("Clear Events", id="btn_clear_events")
             yield Static("")  # Spacer
 
 
@@ -682,32 +520,6 @@ class EBPFManagerApp(App):
     }
     
     OutputLog RichLog {
-        height: 1fr;
-    }
-    
-    TracePipeLog {
-        height: 1fr;
-        border: solid $warning;
-    }
-    
-    TracePipeLog Horizontal {
-        height: auto;
-        width: 100%;
-    }
-    
-    TracePipeLog .panel-title {
-        height: auto;
-        padding: 1;
-        background: $surface;
-        width: 1fr;
-    }
-    
-    TracePipeLog Button {
-        height: auto;
-        min-width: 12;
-    }
-    
-    TracePipeLog RichLog {
         height: 1fr;
     }
     
@@ -871,7 +683,7 @@ class EBPFManagerApp(App):
             "btn_show_status": self.show_status,
             "btn_net_status": self.show_network_status,
             "btn_clear_output": self.clear_output_log,
-            "btn_clear_trace": self.clear_trace_log,
+            "btn_clear_events": self.clear_events_log,
             "btn_save_output": self.save_output,
             "btn_show_stacks": self.show_stack_traces,
         }
@@ -1347,7 +1159,7 @@ class EBPFManagerApp(App):
         output.write("[dim]Command output cleared[/dim]")
         output.write("")
     
-    async def clear_trace_log(self) -> None:
+    async def clear_events_log(self) -> None:
         """Clear ring buffer event log only."""
         output = self.query_one("#output_log", OutputLog)
         ringbuf_log = self.query_one("#ringbuf_log", RingBufferLog)
