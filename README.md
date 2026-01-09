@@ -22,6 +22,17 @@ https://github.com/user-attachments/assets/6380c6bf-5b33-4cfe-b375-4d69a4b083c0
 
 ### Prerequisites
 
+
+
+- ⚠️  needs to be running as root
+    - installs libraries
+    - creates network resources - bridges, veths etc
+    - installs bpf probes  
+- ⚠️  please run it in a vm (tested on Ubuntu 25:10)
+
+
+
+
 ```bash
 # Must run as root
 sudo ./setup.sh

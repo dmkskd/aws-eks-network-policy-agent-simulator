@@ -14,7 +14,170 @@ from textual.reactive import reactive
 from .environment import EnvironmentManager
 from .network_multi import MultiPodNetworkManager
 from .bpf import BPFManager
+from .bpfstats import BPFStatsCollector, BPFProgramStats
 from .stacks import get_stack_traces_text, start_tc_stack_capture, stop_tc_stack_capture, is_tc_capture_running
+
+
+class BPFStatsMonitor(Container):
+    """Live BPF program performance monitor (bpftop-like).
+    
+    Displays real-time statistics for loaded eBPF programs:
+    - Events per second
+    - Average runtime per event
+    - Estimated CPU usage
+    """
+    
+    DEFAULT_CSS = """
+    BPFStatsMonitor {
+        layout: vertical;
+        height: auto;
+        min-height: 6;
+        max-height: 10;
+        border: solid $accent;
+        padding: 0 1;
+        margin: 0 0 1 0;
+    }
+    
+    BPFStatsMonitor .stats-title {
+        text-align: center;
+        color: $text;
+        padding: 0 1;
+    }
+    
+    BPFStatsMonitor .stats-row {
+        height: auto;
+    }
+    
+    BPFStatsMonitor .stats-header {
+        color: $text-muted;
+    }
+    
+    BPFStatsMonitor .prog-ingress {
+        color: $success;
+    }
+    
+    BPFStatsMonitor .prog-egress {
+        color: $warning;
+    }
+    """
+    
+    # Reactive properties to trigger updates
+    ingress_stats: reactive[str] = reactive("[dim]Not loaded[/dim]")
+    egress_stats: reactive[str] = reactive("[dim]Not loaded[/dim]")
+    monitoring_active: reactive[bool] = reactive(False)
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stats_collector = BPFStatsCollector()
+        self.ingress_prog_id: Optional[int] = None
+        self.egress_prog_id: Optional[int] = None
+        self._monitor_task: Optional[asyncio.Task] = None
+    
+    def compose(self) -> ComposeResult:
+        """Compose the stats monitor layout."""
+        yield Static("[bold magenta]BPF Performance (bpftop-style)[/bold magenta]", classes="stats-title")
+        yield Static("[dim]Program  │ Events/s│   Avg Time│   CPU %[/dim]", classes="stats-header")
+        yield Static(id="ingress_stats_line", classes="stats-row prog-ingress")
+        yield Static(id="egress_stats_line", classes="stats-row prog-egress")
+    
+    def watch_ingress_stats(self, new_value: str) -> None:
+        """Update ingress stats display."""
+        try:
+            self.query_one("#ingress_stats_line", Static).update(new_value)
+        except Exception:
+            pass
+    
+    def watch_egress_stats(self, new_value: str) -> None:
+        """Update egress stats display."""
+        try:
+            self.query_one("#egress_stats_line", Static).update(new_value)
+        except Exception:
+            pass
+    
+    def set_program_ids(self, ingress_id: Optional[int], egress_id: Optional[int]) -> None:
+        """Set the program IDs to monitor."""
+        self.ingress_prog_id = ingress_id
+        self.egress_prog_id = egress_id
+    
+    async def start_monitoring(self) -> None:
+        """Start the stats monitoring loop."""
+        if self._monitor_task and not self._monitor_task.done():
+            return  # Already running
+        
+        # Enable kernel BPF stats
+        await asyncio.to_thread(self.stats_collector.enable_stats)
+        self.monitoring_active = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+    
+    async def stop_monitoring(self) -> None:
+        """Stop the stats monitoring loop."""
+        self.monitoring_active = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
+        
+        # Disable kernel BPF stats to reduce overhead
+        await asyncio.to_thread(self.stats_collector.disable_stats)
+    
+    async def _monitor_loop(self) -> None:
+        """Background loop that samples BPF stats every second."""
+        try:
+            while self.monitoring_active:
+                await self._update_stats()
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+    
+    async def _update_stats(self) -> None:
+        """Sample and update stats display."""
+        program_ids = []
+        if self.ingress_prog_id:
+            program_ids.append(self.ingress_prog_id)
+        if self.egress_prog_id:
+            program_ids.append(self.egress_prog_id)
+        
+        if not program_ids:
+            self.ingress_stats = "[dim]Ingress  │       --│         --│      --[/dim]"
+            self.egress_stats = "[dim]Egress   │       --│         --│      --[/dim]"
+            return
+        
+        # Sample stats in background thread
+        stats = await asyncio.to_thread(
+            self.stats_collector.sample_programs, program_ids
+        )
+        
+        # Format ingress stats
+        if self.ingress_prog_id and self.ingress_prog_id in stats:
+            s = stats[self.ingress_prog_id]
+            self.ingress_stats = self._format_stats_line("Ingress", s, "green")
+        else:
+            self.ingress_stats = "[dim]Ingress  │       --│         --│      --[/dim]"
+        
+        # Format egress stats
+        if self.egress_prog_id and self.egress_prog_id in stats:
+            s = stats[self.egress_prog_id]
+            self.egress_stats = self._format_stats_line("Egress", s, "yellow")
+        else:
+            self.egress_stats = "[dim]Egress   │       --│         --│      --[/dim]"
+    
+    def _format_stats_line(self, name: str, stats: BPFProgramStats, color: str) -> str:
+        """Format a stats line for display."""
+        events_sec = stats.events_per_sec
+        avg_time_us = stats.avg_runtime_ns / 1000  # Convert to microseconds
+        cpu_pct = stats.cpu_percent
+        
+        # Column widths to match header:
+        # "Program  │ Events/s│   Avg Time│   CPU %"
+        # COL1=9, COL2=9, COL3=11, COL4=8
+        events_str = f"{events_sec:>9.0f}"
+        time_str = f"{avg_time_us:>9.2f}µs" if avg_time_us > 0 else "        --"
+        cpu_str = f"{cpu_pct:>7.3f}%" if cpu_pct > 0 else "     --"
+        
+        return f"[{color}]{name:<9}│{events_str}│{time_str}│{cpu_str}[/{color}]"
 
 
 class StatusBar(Static):
@@ -459,6 +622,7 @@ class EBPFManagerApp(App):
             with Vertical(id="right_panel"):
                 yield OutputLog(id="output_log")
                 yield TracePipeLog(id="trace_log")
+                yield BPFStatsMonitor(id="bpf_stats")
         
         yield StatusBar()
         yield Footer()
@@ -491,6 +655,36 @@ class EBPFManagerApp(App):
         
         # Small delay to ensure widgets are mounted
         await asyncio.sleep(0.1)
+    
+    async def on_unmount(self) -> None:
+        """Cleanup when app is closing."""
+        # Stop BPF stats monitoring (disables kernel stats gathering)
+        try:
+            stats_monitor = self.query_one("#bpf_stats", BPFStatsMonitor)
+            await stats_monitor.stop_monitoring()
+        except Exception:
+            pass
+        
+        # Stop trace pipe
+        try:
+            trace_log = self.query_one("#trace_log", TracePipeLog)
+            trace_log.stop_trace()
+        except Exception:
+            pass
+        
+        # Unload BPF programs (remove TC filters and pinned maps)
+        try:
+            if self.bpf_mgr:
+                await asyncio.to_thread(self.bpf_mgr.unload)
+        except Exception:
+            pass
+        
+        # Stop stack trace capture
+        try:
+            if is_tc_capture_running():
+                await asyncio.to_thread(stop_tc_stack_capture)
+        except Exception:
+            pass
     
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button press events."""
@@ -624,11 +818,30 @@ class EBPFManagerApp(App):
         
         if result:
             output.log_success(f"Validation: Program loaded on {self.net_mgr.backend.veth_host} - ID {self.bpf_mgr.program_id}")
+            if self.bpf_mgr.egress_program_id:
+                output.write(f"[cyan]  Egress Program ID: {self.bpf_mgr.egress_program_id}[/cyan]")
             if self.bpf_mgr.map_id:
                 output.write(f"[cyan]  Map ID: {self.bpf_mgr.map_id}[/cyan]")
             status = self.query_one(StatusBar)
             status.program_id = self.bpf_mgr.program_id
             status.map_id = self.bpf_mgr.map_id
+            
+            # Start BPF performance monitoring (bpftop-style)
+            output.write("")
+            output.write("[bold magenta]═══ BPF Performance Monitoring ═══[/bold magenta]")
+            output.write("[dim]Starting bpftop-style performance monitor...[/dim]")
+            
+            try:
+                stats_monitor = self.query_one("#bpf_stats", BPFStatsMonitor)
+                stats_monitor.set_program_ids(
+                    self.bpf_mgr.program_id,
+                    self.bpf_mgr.egress_program_id
+                )
+                await stats_monitor.start_monitoring()
+                output.log_success("BPF stats monitoring started")
+                output.write("[dim]  Live stats shown in the performance panel above[/dim]")
+            except Exception as e:
+                output.log_error(f"Stats monitoring failed: {e}")
             
             # Start TC-level stack trace capture
             output.write("")
@@ -1117,6 +1330,39 @@ class EBPFManagerApp(App):
             await self.stop_trace()
         else:
             await self.start_trace()
+    
+    async def action_quit(self) -> None:
+        """Clean up and quit the application."""
+        # Unload BPF programs (remove TC filters and pinned maps)
+        try:
+            if self.bpf_mgr:
+                await asyncio.to_thread(self.bpf_mgr.unload)
+        except Exception:
+            pass
+        
+        # Stop BPF stats monitoring
+        try:
+            stats_monitor = self.query_one("#bpf_stats", BPFStatsMonitor)
+            await stats_monitor.stop_monitoring()
+        except Exception:
+            pass
+        
+        # Stop trace pipe
+        try:
+            trace_log = self.query_one("#trace_log", TracePipeLog)
+            trace_log.stop_trace()
+        except Exception:
+            pass
+        
+        # Stop stack trace capture
+        try:
+            if is_tc_capture_running():
+                await asyncio.to_thread(stop_tc_stack_capture)
+        except Exception:
+            pass
+        
+        # Now quit
+        self.exit()
 
 
 def run_tui() -> None:

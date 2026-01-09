@@ -20,7 +20,8 @@ class BPFManager:
     
     def __init__(self, interface: str = "veth-host", source_file: Optional[Path] = None, output=None):
         self.interface = interface
-        self.program_id: Optional[int] = None
+        self.program_id: Optional[int] = None  # Ingress program ID
+        self.egress_program_id: Optional[int] = None  # Egress program ID
         self.map_id: Optional[int] = None
         self.output = output  # Optional TUI output log
         
@@ -192,18 +193,43 @@ class BPFManager:
         return True
     
     def cleanup_filters(self) -> None:
-        """Remove existing BPF filters."""
+        """Remove existing BPF filters from both directions."""
         self._print("[yellow]Cleaning old BPF filters...[/yellow]")
+        
+        # Clean TC egress (where ingress BPF program attaches)
+        result = self._run(
+            ["tc", "filter", "del", "dev", self.interface, "egress"],
+            check=False
+        )
+        if result.returncode == 0:
+            self._print(f"[cyan]$ tc filter del dev {self.interface} egress[/cyan]")
+        else:
+            self._print(f"[dim]No previous egress filters found on {self.interface}[/dim]")
+        
+        # Clean TC ingress (where egress BPF program attaches)
         result = self._run(
             ["tc", "filter", "del", "dev", self.interface, "ingress"],
             check=False
         )
-        
         if result.returncode == 0:
             self._print(f"[cyan]$ tc filter del dev {self.interface} ingress[/cyan]")
         else:
             self._print(f"[dim]No previous ingress filters found on {self.interface}[/dim]")
+        
         self._print("")
+    
+    def unload(self) -> None:
+        """Unload BPF programs and clean up resources.
+        
+        Call this on shutdown to remove TC filters and pinned maps.
+        """
+        self._print("[yellow]Unloading BPF programs...[/yellow]")
+        self.cleanup_filters()
+        self.cleanup_pinned_maps()
+        self.program_id = None
+        self.egress_program_id = None
+        self.map_id = None
+        self._print("[green]BPF programs unloaded[/green]")
     
     def cleanup_pinned_maps(self) -> None:
         """Remove pinned BPF maps to ensure clean state.
@@ -798,20 +824,26 @@ class BPFManager:
         if self.egress_obj_file and self.egress_obj_file.exists():
             # Temporarily switch to egress program
             original_obj = self.obj_file
+            ingress_prog_id = self.program_id  # Save ingress program ID
             self.obj_file = self.egress_obj_file
-            
+
             if not self.load_program():
                 self._print("[yellow][WARN] Egress program failed to load, continuing with ingress only[/yellow]")
                 self._print("")
                 self.obj_file = original_obj  # Restore
+                self.program_id = ingress_prog_id  # Restore ingress ID
             else:
                 # Verify egress program
                 if self.verify_program():
                     self._print("[dim]Egress program loaded successfully[/dim]")
                     self._print("")
+                    # Save egress program ID and restore ingress ID
+                    self.egress_program_id = self.program_id
+                    self.program_id = ingress_prog_id
                 else:
                     self._print("[yellow][WARN] Egress program verification failed[/yellow]")
                     self._print("")
+                    self.program_id = ingress_prog_id  # Restore ingress ID
                 self.obj_file = original_obj  # Restore
         else:
             self._print("")
