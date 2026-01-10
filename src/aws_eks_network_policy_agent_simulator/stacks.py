@@ -343,10 +343,10 @@ def _find_map_id(map_name: str) -> Optional[int]:
 
 
 def get_recent_stacks_from_map() -> List[int]:
-    """Get recent stack IDs directly from the BPF ring buffer map.
+    """Get recent stack IDs directly from the BPF array map.
     
     Returns:
-        List of unique stack_ids
+        List of unique stack_ids from the newest (highest ID) map only
     """
     stack_ids = set()
     
@@ -376,10 +376,13 @@ def get_recent_stacks_from_map() -> List[int]:
     except Exception:
         pass
     
-    # Also try finding map by name (for BCC maps)
+    # Find map by name - use only the newest (highest ID) to avoid stale data
     if not stack_ids:
-        map_id = _find_map_id('recent_stack_ids')
-        if map_id:
+        # BCC truncates map names - search for 'recent_stack_id' (15 char limit)
+        map_ids = _find_map_ids('recent_stack_id')
+        if map_ids:
+            # Highest ID = newest map = currently running capture
+            map_id = map_ids[0]
             try:
                 result = subprocess.run(
                     ['sudo', 'bpftool', 'map', 'dump', 'id', str(map_id), '-j'],

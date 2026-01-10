@@ -1189,6 +1189,16 @@ class EBPFManagerApp(App):
         output = self.query_one("#output_log", OutputLog)
         
         try:
+            # Ensure TC capture is running
+            if not is_tc_capture_running():
+                output.write("[dim]Starting TC stack capture...[/dim]")
+                success = await asyncio.to_thread(start_tc_stack_capture)
+                if success:
+                    output.log_success("TC stack capture started")
+                else:
+                    output.log_error("Failed to start TC stack capture")
+                    output.write("[dim]BCC may not be installed or running as root[/dim]")
+            
             # Get stack traces as plain text
             result = get_stack_traces_text()
             
